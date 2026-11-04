@@ -1,0 +1,24 @@
+{
+  "grace_hours": 24,
+  "remind_every_days": 3,
+  "exclude_banks": [
+    "amex"
+  ],
+  "default_tariff": {
+    "rate": 0.16,
+    "op_fee": 8.0,
+    "op_fee_cap_month": 80.0,
+    "rejection_fee": 20.0
+  },
+  "banks": {
+    "sg": {
+      "note": "Société Générale (brochure 01/10/2026) : commission d'intervention 8 €/op, max 80 €/mois ; rejet de prélèvement 20 € ; TAEG découvert selon relevé.",
+      "rate": 0.2348,
+      "rate_note": "TAEG max affiché en brochure ; remplacer par celui du relevé",
+      "op_fee": 8.0,
+      "op_fee_cap_month": 80.0,
+      "rejection_fee": 20.0,
+      "authorized_overdraft": 0.0
+    }
+  }
+}

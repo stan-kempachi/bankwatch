@@ -1,0 +1,13 @@
+[Unit]
+Description=BankWatch — sync banques + contrôles + alertes Discord
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/apps/bankwatch
+EnvironmentFile=/home/pi/apps/bankwatch/.env
+ExecStart=/home/pi/apps/bankwatch/.venv/bin/bankwatch run
+# code 2 = erreur de sync déjà signalée sur Discord : pas d'échec systemd
+SuccessExitStatus=2

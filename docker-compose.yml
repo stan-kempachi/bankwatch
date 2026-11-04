@@ -1,0 +1,30 @@
+services:
+  # Dashboard web (lecture seule sur la base)
+  dashboard:
+    build: .
+    container_name: bankwatch-dashboard
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./rules:/app/rules:ro
+    ports:
+      - "127.0.0.1:8787:8787"   # exposé en local uniquement : passe par Tailscale / reverse proxy authentifié
+    restart: unless-stopped
+
+  # Job quotidien : sync + contrôles + alertes Discord (+ rapport hebdo le lundi)
+  worker:
+    build: .
+    container_name: bankwatch-worker
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./rules:/app/rules:ro
+    # 3 passages par jour (DSP2 : 4 accès / compte / jour = 3 × transactions + 1 × solde)
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          bankwatch run || echo "[worker] run en erreur (code $$?)"
+          sleep 28800
+        done
+    restart: unless-stopped

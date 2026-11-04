@@ -1,0 +1,17 @@
+[Unit]
+Description=BankWatch — dashboard (FastAPI :8117)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/apps/bankwatch
+EnvironmentFile=/home/pi/apps/bankwatch/.env
+ExecStart=/home/pi/apps/bankwatch/.venv/bin/bankwatch serve --host 127.0.0.1 --port 8117
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

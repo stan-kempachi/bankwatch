@@ -1,0 +1,37 @@
+[project]
+name = "bankwatch"
+version = "0.1.0"
+description = "Surveillance de comptes bancaires (GoCardless Bank Account Data) : doublons, prélèvements anormaux, surdépense, alertes Discord, dashboard."
+authors = [{ name = "Stan", email = "stan@karakuri.studio" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pyjwt[crypto]>=2.8",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "typer>=0.12",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+bankwatch = "bankwatch.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bankwatch"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

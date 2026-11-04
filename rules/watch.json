@@ -1,0 +1,16 @@
+{
+  "exemple_saas": {
+    "label": "Mon SaaS (exemple)",
+    "match": [
+      "nom-du-marchand"
+    ],
+    "since": "2026-01-01",
+    "small_charge_max": 30,
+    "subscription_match": [
+      "sub"
+    ],
+    "expected_amount": 20,
+    "monthly_cap": 60,
+    "note": "Abonnement seul attendu : toute recharge est signalée."
+  }
+}

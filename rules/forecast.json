@@ -1,0 +1,23 @@
+{
+  "horizon_days": 14,
+  "margin": 50,
+  "transfer_round": 5,
+  "card_settlements": [
+    {
+      "label": "Règlement carte à débit différé",
+      "card_bank": "amex",
+      "debit_bank": "boursobank",
+      "match": [
+        "american express"
+      ],
+      "due_day": 30,
+      "notice_days": 3
+    }
+  ],
+  "accounts": {
+    "indy": {
+      "pro": true,
+      "note": "Compte pro : un virement vers un compte perso est un prélèvement de l'exploitant."
+    }
+  }
+}

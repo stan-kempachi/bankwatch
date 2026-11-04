@@ -1,0 +1,16 @@
+{
+  "_comment": "Mots-clés perso, prioritaires sur les règles par défaut (bankwatch/categorize.py). Un espace tolère espaces/astérisques dans le libellé.",
+  "perso": [
+    "mon-coiffeur",
+    "tabac"
+  ],
+  "assurances": [
+    "mon-assureur"
+  ],
+  "restos": [
+    "ma-boulangerie"
+  ],
+  "logement": [
+    "loyer"
+  ]
+}

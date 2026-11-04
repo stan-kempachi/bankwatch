@@ -1,0 +1,10 @@
+[Unit]
+Description=BankWatch — 3 synchros par jour (DSP2 : 4 accès/compte/jour = 3 × transactions + 1 × solde)
+
+[Timer]
+OnCalendar=*-*-* 07,13,20:20:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
