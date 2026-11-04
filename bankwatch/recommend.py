@@ -81,6 +81,7 @@ def analyse(db: Database, today: date | None = None) -> tuple[list[Need], list[S
     today = today or date.today()
     cfg = load_config()
     import json
+
     from .forecast import FORECAST_FILE
 
     raw = json.loads(FORECAST_FILE.read_text(encoding="utf-8")) if FORECAST_FILE.exists() else {}

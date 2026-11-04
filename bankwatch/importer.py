@@ -98,7 +98,7 @@ def parse_csv(text: str) -> list[dict]:
     delim = max(";,\t|", key=lambda d: sample.count(d))
     rows = list(csv.reader(io.StringIO(text), delimiter=delim))
     # en-tête = première ligne qui contient une colonne date et une colonne montant/débit
-    for hi, row in enumerate(rows[:40]):
+    for hi, row in enumerate(rows[:40]):  # noqa: B007 — hi est réutilisé après la boucle (ligne d'en-tête)
         cols = _map_columns(row)
         if "date" in cols and ("amount" in cols or "debit" in cols or "credit" in cols):
             break
@@ -112,7 +112,7 @@ def parse_csv(text: str) -> list[dict]:
         if not d:
             continue
 
-        def cell(k: str) -> str:
+        def cell(k: str, row: list[str] = row) -> str:
             i = cols.get(k)
             return row[i].strip() if i is not None and i < len(row) else ""
 
@@ -132,7 +132,7 @@ def parse_csv(text: str) -> list[dict]:
 def parse_ofx(text: str) -> list[dict]:
     out = []
     for block in re.findall(r"<STMTTRN>(.*?)(?:</STMTTRN>|(?=<STMTTRN>)|(?=</BANKTRANLIST>))", text, flags=re.S | re.I):
-        def tag(name: str) -> str:
+        def tag(name: str, block: str = block) -> str:
             m = re.search(rf"<{name}>([^<\r\n]*)", block, flags=re.I)
             return m.group(1).strip() if m else ""
 

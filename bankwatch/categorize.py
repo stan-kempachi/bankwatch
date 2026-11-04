@@ -81,7 +81,9 @@ class Categorizer:
             names = [n for n in names.split(",")]
         self._owners = [t for t in (_tokens(n) for n in names) if len(t) >= 2]  # prénom + nom minimum
         custom = load_custom(custom_path) if custom is None else custom
-        compile_ = lambda kws: re.compile("|".join(_pattern(k) for k in kws))
+        def compile_(kws: list[str]) -> re.Pattern[str]:
+            return re.compile("|".join(_pattern(k) for k in kws))
+
         # 1) mots-clés perso (prioritaires), 2) règles par défaut dans leur ordre
         self._compiled = [(cat, compile_(kws)) for cat, kws in custom.items() if kws]
         self._compiled += [(cat, compile_(kws)) for cat, kws in self.rules.items() if kws]

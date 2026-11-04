@@ -227,7 +227,6 @@ def test_categorize_bank_labels(who, expected):
 
 
 def test_custom_rules_take_precedence(tmp_path):
-    from bankwatch.categorize import load_rules
 
     p = tmp_path / "c.json"
     p.write_text('{"perso": ["mon-coiffeur"], "transport": ["dott"], "restos": ["les delices de a"]}')

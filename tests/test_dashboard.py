@@ -201,7 +201,7 @@ def test_cumulative_variable_spend_and_projection(client):
     d = client.get("/api/cumulative", headers=h).json()
     assert len(d["days"]) in (28, 29, 30, 31) and len(d["current"]) == d["today"]
     assert d["projection"][d["today"] - 1] == d["current"][-1]  # l'estimation part du réel
-    assert all(a <= b for a, b in zip(d["projection"][d["today"] - 1:], d["projection"][d["today"]:]))  # croissante
+    assert all(a <= b for a, b in zip(d["projection"][d["today"] - 1:], d["projection"][d["today"]:], strict=False))  # croissante
     assert d["end_estimate"] >= d["current"][-1]
     assert "logement" in d["excluded"] and "impots_taxes" in d["excluded"]
 

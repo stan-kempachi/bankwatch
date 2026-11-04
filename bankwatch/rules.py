@@ -12,7 +12,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from .config import Settings, settings as default_settings
+from .config import Settings
+from .config import settings as default_settings
 from .db import Tx
 
 HIGH, MEDIUM, LOW = "high", "medium", "low"
@@ -90,7 +91,7 @@ def recurring_merchants(history: list[Tx], min_occurrences: int = 3) -> dict[str
         txs.sort(key=lambda t: t.booking_date)
         if len(txs) < min_occurrences:
             continue
-        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(txs, txs[1:])]
+        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(txs, txs[1:], strict=False)]
         gaps = [g for g in gaps if g > 0]
         monthly = bool(gaps) and 24 <= statistics.median(gaps) <= 37
         subscription_like = all(t.category in ("abonnements", "logement") for t in txs)
@@ -131,7 +132,7 @@ def detect_recurring_anomalies(history: list[Tx], candidates: list[Tx], s: Setti
                 )
         # 2) deux fois dans la même fenêtre mensuelle : écart nettement plus court que la cadence
         #    habituelle, ou deux passages dans le même mois calendaire
-        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(prev, prev[1:])]
+        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(prev, prev[1:], strict=False)]
         cadence = statistics.median(gaps) if gaps else 30
         last = prev[-1]
         gap = (c.booking_date - last.booking_date).days

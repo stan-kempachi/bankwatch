@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import calendar
-from collections import defaultdict
-from datetime import date, datetime, timedelta
-from pathlib import Path
-
 import base64
+import calendar
 import hashlib
 import threading
 import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 from .config import settings
 from .db import Database
 from .pipeline import build_report
-from .rules import recurring_merchants, spend_by_category, _prev_months, _month_start
+from .rules import _month_start, _prev_months, recurring_merchants, spend_by_category
 
 app = FastAPI(title="BankWatch", docs_url=None, redoc_url=None, openapi_url=None)
 STATIC = Path(__file__).parent / "static"
@@ -413,10 +412,14 @@ def cumulative():
     spent = current[-1] if current else 0.0
     if avg:
         base = avg[min(today.day, len(avg)) - 1]
-        proj = lambda d: round(spent + max(0.0, avg[min(d, len(avg)) - 1] - base), 2)
+
+        def proj(d: int) -> float:
+            return round(spent + max(0.0, avg[min(d, len(avg)) - 1] - base), 2)
     else:
         pace = spent / today.day if today.day else 0.0
-        proj = lambda d: round(pace * d, 2)
+
+        def proj(d: int) -> float:
+            return round(pace * d, 2)
     projection = [None] * (today.day - 1) + [proj(d) for d in range(today.day, days_in_month + 1)] if current else []
     return {
         "days": list(range(1, days_in_month + 1)), "today": today.day,
@@ -439,7 +442,7 @@ def recurring():
         last = items[-1]
         prev_amounts = [abs(t.amount) for t in items[:-1][-6:]]
         ref = sorted(prev_amounts)[len(prev_amounts) // 2] if prev_amounts else abs(last.amount)
-        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(items, items[1:])]
+        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(items, items[1:], strict=False)]
         cadence = sorted(gaps)[len(gaps) // 2] if gaps else None
         next_due = (last.booking_date + timedelta(days=cadence)).isoformat() if cadence else None
         out.append({

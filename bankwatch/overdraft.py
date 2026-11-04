@@ -68,7 +68,7 @@ def calibrate_rate(db: Database, account_id: str, balance: float, today: date) -
     return round(sum(abs(a.amount) for a in agios) * 365 / neg_days, 4)
 
 
-def estimate_fees(db: Database, od: "Overdraft", today: date, cfg: dict) -> dict[str, Any]:
+def estimate_fees(db: Database, od: Overdraft, today: date, cfg: dict) -> dict[str, Any]:
     base = cfg.get("default_tariff") or {"rate": 0.16, "op_fee": 8.0, "op_fee_cap_month": 80.0, "rejection_fee": 20.0}
     tariff = {**base, **{k: v for k, v in cfg.get("banks", {}).get(od.bank, {}).items() if k in base}}
     calibrated = calibrate_rate(db, od.account_id, od.balance, today)

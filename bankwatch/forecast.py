@@ -134,13 +134,13 @@ def upcoming(db: Database, today: date | None = None, cfg: ForecastConfig | None
     # 2) prélèvements récurrents détectés
     settle_terms = [m.lower() for cs in cfg.card_settlements for m in cs.get("match", [])]
     txs = db.transactions(since=today - timedelta(days=400), debits_only=True)
-    for key, items in recurring_merchants(txs).items():
+    for _key, items in recurring_merchants(txs).items():
         last = items[-1]
         if last.account_id not in accounts or last.category == "epargne_virement":
             continue
         if any(t in f"{last.counterparty} {last.label}".lower() for t in settle_terms):
             continue  # déjà couvert par le règlement de carte
-        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(items, items[1:])]
+        gaps = [(b.booking_date - a.booking_date).days for a, b in zip(items, items[1:], strict=False)]
         cadence = sorted(gaps)[len(gaps) // 2] if gaps else 30
         if 27 <= cadence <= 32:  # mensuel : même jour du mois que la dernière occurrence
             due = next_due_day(max(today, last.booking_date + timedelta(days=1)), last.booking_date.day)

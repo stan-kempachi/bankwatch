@@ -32,9 +32,8 @@ def run_checks(db: Database, new_txs: list[Tx] | None = None, today: date | None
         candidates = [t for t in history if t.booking_date >= cutoff]
     else:
         candidates = [t for t in new_txs if t.booking_date >= cutoff]
-    from .watch import claimed_ids, detect_watch
-
     from .forecast import detect_forecast
+    from .watch import claimed_ids, detect_watch
 
     alerts = run_all(history, candidates, today=today, skip_ids=claimed_ids(candidates))
     from .overdraft import detect_overdraft

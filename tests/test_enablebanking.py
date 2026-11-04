@@ -182,10 +182,10 @@ def test_daily_quota_guard(eb, tmp_path, monkeypatch):
     def api_calls():
         return [c for c in eb.calls if c[1].startswith(f"/accounts/{acc}/")]
 
-    n0 = len(api_calls())
     eb_sync_all(db, eb, today=d)                       # tx (2 pages = 1 accès logique) + solde
     assert accesses_today(db, acc, d) == 2
-    eb_sync_all(db, eb, today=d); eb_sync_all(db, eb, today=d)
+    eb_sync_all(db, eb, today=d)
+    eb_sync_all(db, eb, today=d)
     assert accesses_today(db, acc, d) == 4             # pas de 2e lecture du solde
     r, _ = eb_sync_all(db, eb, today=d)                # 4e passage : sauté, aucun appel
     assert r[0].skipped and len(api_calls()) == len(api_calls())
