@@ -62,7 +62,14 @@ def _pattern(keyword: str) -> str:
     return r"[\s*.\-_]*".join(parts)
 
 
-TRANSFER_RX = re.compile(r"\bvir(ement)?\b")
+TRANSFER_RX = re.compile(r"\bvir(ement)?\b|\binstantan|\btransfer")
+GENERIC_WORDS = {"vir", "virement", "en", "ligne", "ope", "de", "compte", "motif", "ref", "remise", "instantane",
+                 "recu", "emis", "sepa", "inst", "cb", "carte", "date", "re", "le", "la", "du", "des", "et"}
+
+
+def counterparty_is_generic(counterparty: str | None) -> bool:
+    """Vrai si la contrepartie ne contient aucun mot porteur (« EN LIGNE OPE: DE: Compte MOTIF »)."""
+    return not (_tokens(counterparty or "") - GENERIC_WORDS)
 
 
 def _tokens(text: str) -> set[str]:
@@ -94,7 +101,7 @@ class Categorizer:
             # virement entre tes propres comptes : c'est la CONTREPARTIE qui porte ton nom.
             # Si la banque ne la fournit pas (libellé seul), on regarde le libellé ; sinon on ignore
             # le texte libre, où ton nom apparaît aussi sur les factures payées par tes clients.
-            toks = _tokens(counterparty) if (counterparty or "").strip() else _tokens(label)
+            toks = _tokens(counterparty) if not counterparty_is_generic(counterparty) else _tokens(label)
             if any(o <= toks for o in self._owners):
                 return "epargne_virement"
         compiled = self._compiled
@@ -107,7 +114,7 @@ class Categorizer:
                 return cat
         # « virement » / « vir » sans mot-clé plus précis : interne seulement si la contrepartie est inconnue ;
         # un virement reçu d'un tiers nommé est une entrée, un virement émis vers un tiers une dépense.
-        if TRANSFER_RX.search(text) and not (counterparty or "").strip():
+        if TRANSFER_RX.search(text) and counterparty_is_generic(counterparty):
             return "epargne_virement"
         if amount > 0:
             return "revenus"

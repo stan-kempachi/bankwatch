@@ -555,8 +555,8 @@ async function loadSync() {
     const can = isAdmin && a.remaining > 0 && !d.running;
     return `<tr><td><b>${esc(bankName(a.bank))}</b><div style="color:var(--muted);font-size:11px">${esc(a.name || '')}</div></td>
       <td style="white-space:nowrap"><span class="quota" title="${a.used} utilisé(s) sur ${a.limit}">${dots}</span><span style="color:var(--ink-2)">${a.used} utilisé${a.used > 1 ? 's' : ''}</span><div style="font-size:11px;color:${a.remaining ? 'var(--good-text)' : 'var(--critical)'}">${a.remaining ? a.remaining + ' restant' + (a.remaining > 1 ? 's' : '') : 'quota épuisé, reprise demain'}</div></td>
-      <td class="hide-sm">${agoTxt}${a.balance_read_today ? '' : ' <span class="pill" title="le solde sera relu au prochain passage">solde à relire</span>'}</td>
-      <td class="num"><button class="btn" data-sync="${esc(a.account_id)}" ${can ? '' : 'disabled'} title="${isAdmin ? (a.remaining ? 'Consomme 1 accès du quota' : 'Quota du jour épuisé') : 'Réservé à l’administrateur'}">Synchroniser</button></td></tr>`;
+      <td class="hide-sm">${agoTxt}${a.balance_read_today ? '' : ' <span class="pill" title="le solde sera relu au prochain passage">solde à relire</span>'}${a.balance_delta ? ` <span class="pill" title="opérations vues depuis la lecture du solde">${a.balance_delta > 0 ? '+' : ''}${fmt.format(a.balance_delta)} depuis le solde</span>` : ''}</td>
+      <td class="num"><button class="btn" data-sync="${esc(a.account_id)}" ${can ? '' : 'disabled'} title="${isAdmin ? (a.remaining ? 'Transactions + solde : consomme 2 accès du quota (1 s’il n’en reste qu’un)' : 'Quota du jour épuisé') : 'Réservé à l’administrateur'}">Synchroniser</button></td></tr>`;
   }).join('');
   const next = d.next_runs.map(t => new Date(t)).sort((a, b) => a - b)[0];
   document.getElementById('sync-next').textContent = next ? `Prochain passage automatique : ${next.toLocaleString('fr-FR', { weekday: 'short', hour: '2-digit', minute: '2-digit' })} (${d.next_runs.length} par jour)` : '';
@@ -618,9 +618,11 @@ async function loadSummary() {
   document.getElementById('k-balance').textContent = fmt.format(s.total_balance);
   document.getElementById('k-card-owed').textContent = s.card_owed ? `comptes courants · carte à régler : ${fmt2.format(s.card_owed)}` : 'comptes courants';
   const rows = s.accounts.slice().sort((a, b) => (a.is_card - b.is_card) || (b.balance || 0) - (a.balance || 0));
+  const readTxt = a => a.balance_read_at ? new Date(a.balance_read_at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '';
   document.getElementById('k-accounts').innerHTML = rows.map(a => `<tr>
-    <td><b>${esc(bankName(a.bank))}</b> <span class="sub">${esc((a.name || '').slice(0, 24))}${a.iban ? ' · …' + esc(a.iban.slice(-4)) : ''}${a.is_card ? ' · carte' : ''}</span></td>
-    <td class="num ${(a.balance || 0) < 0 && !a.is_card ? 'neg' : ''}" style="text-align:right">${a.balance != null ? fmt2.format(a.balance) : '—'}</td></tr>`).join('');
+    <td><b>${esc(bankName(a.bank))}</b> <span class="sub">${esc((a.name || '').slice(0, 24))}${a.iban ? ' · …' + esc(a.iban.slice(-4)) : ''}${a.is_card ? ' · carte' : ''}</span>
+      ${a.balance_delta ? `<div class="sub" title="Le solde n'est lu à la banque qu'une fois par jour (quota) ; les opérations vues depuis sont ajoutées.">lu à ${readTxt(a)} : ${fmt2.format(a.balance_read)} · ${a.balance_delta > 0 ? '+' : ''}${fmt2.format(a.balance_delta)} depuis</div>` : ''}</td>
+    <td class="num ${(a.balance || 0) < 0 && !a.is_card ? 'neg' : ''}" style="text-align:right">${a.balance != null ? fmt2.format(a.balance) : '—'}${a.balance_delta ? '<div class="sub">estimé</div>' : ''}</td></tr>`).join('');
   document.getElementById('k-spend').textContent = fmt.format(s.month_spend);
   const ref = s.prev_month_same_day;
   if (ref > 0) {

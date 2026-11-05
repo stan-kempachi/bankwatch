@@ -139,6 +139,13 @@ L'historique des soldes est reconstitué depuis les opérations (solde à J = so
 
 Quand un compte a un besoin (découvert + marge, ou prélèvements à venir non couverts) et qu'un autre a du disponible (solde − ses propres échéances − marge − règlement de carte à prévoir), BankWatch propose le virement : montant arrondi à 5 €, comptes personnels avant les comptes pro (`accounts.<bank>.pro` dans `rules/forecast.json`), note comptable pour un compte pro. Alerte Discord « 💡 Virer X € de A vers B » une fois par semaine et par besoin, carte « Recommandations » en tête du dashboard. BankWatch ne fait **jamais** le virement lui-même.
 
+## Brancher d'autres applications
+
+BankWatch reste la seule application qui parle aux banques (quota DSP2) ; les autres se servent chez lui :
+API de lecture `/api/export/accounts` et `/api/export/transactions` avec un jeton (`bankwatch token create <appli>`),
+et webhooks **CloudEvents** signés HMAC après chaque synchro (`rules/webhooks.json`, `bankwatch webhook-test`).
+Détails et schémas dans [docs/INTEGRATION.md](docs/INTEGRATION.md).
+
 ## Synchronisation manuelle
 
 La carte « Synchronisation » montre, par compte, les accès consommés sur les 4 autorisés par jour, la dernière synchro et le prochain passage automatique. Le bouton **Synchroniser** (admin) lance la synchro d'un compte : il consomme 1 accès, est grisé quand le quota est épuisé, et déclenche les contrôles et alertes sur les nouvelles opérations.

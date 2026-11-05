@@ -119,9 +119,8 @@ def balance_history(db: Database, account_id: str, balance: float, today: date, 
     since = today - timedelta(days=days)
     txs = db.transactions(since=since + timedelta(days=1), account_id=account_id)
     by_day: dict[date, float] = {}
-    for t in txs:
-        if t.status == "booked":
-            by_day[t.booking_date] = by_day.get(t.booking_date, 0.0) + t.amount
+    for t in txs:  # en attente comprises : les soldes bancaires (et notre estimation) les intègrent
+        by_day[t.booking_date] = by_day.get(t.booking_date, 0.0) + t.amount
     out: list[tuple[date, float]] = []
     bal = balance
     d = today
@@ -137,17 +136,19 @@ def current_overdrafts(db: Database, today: date | None = None, cfg: dict | None
     cfg = cfg or load_config()
     out = []
     for a in db.accounts(include_ignored=False):
-        if a["bank"] in cfg["exclude_banks"] or a["balance"] is None or a["balance"] >= 0:
+        eff = db.effective_balance(a["id"])["estimate"]
+        bal = eff if eff is not None else a["balance"]
+        if a["bank"] in cfg["exclude_banks"] or bal is None or bal >= 0:
             continue
-        hist = balance_history(db, a["id"], float(a["balance"]), today)
+        hist = balance_history(db, a["id"], float(bal), today)
         since = today
         for d, b in reversed(hist):
             if b >= 0:
                 break
             since = d
         neg = [b for d, b in hist if d >= since]
-        out.append(Overdraft(a["id"], a["bank"], a["name"] or "", float(a["balance"]), since, (today - since).days,
-                             min(neg) if neg else float(a["balance"]), hist,
+        out.append(Overdraft(a["id"], a["bank"], a["name"] or "", float(bal), since, (today - since).days,
+                             min(neg) if neg else float(bal), hist,
                              cfg["banks"].get(a["bank"], {}).get("note", "")))
     return out
 

@@ -89,7 +89,7 @@ def sync_all(db: Database, gc: GoCardlessClient, lookback_days: int | None = Non
             try:
                 bal = _pick_balance(gc.balances(acc_id))
                 if bal is not None:
-                    db.set_balance(acc_id, bal[0], bal[1])
+                    db.set_balance(acc_id, bal[0], bal[1], read=True)
                 else:
                     db.set_balance(acc_id, acc["balance"], acc["balance_date"])
             except GoCardlessError as e:
@@ -141,7 +141,8 @@ def eb_finalize(db: Database, eb, code: str, state: str) -> tuple[str, int]:
     return row["bank"], len(accounts)
 
 
-def eb_sync_account(db: Database, eb, acc, today: date | None = None, lookback_days: int | None = None) -> tuple[SyncResult, list[Tx]]:
+def eb_sync_account(db: Database, eb, acc, today: date | None = None, lookback_days: int | None = None,
+                    force_balance: bool = False) -> tuple[SyncResult, list[Tx]]:
     """Synchro d'UN compte Enable Banking dans le quota DSP2 : transactions à chaque passage,
     solde une fois par jour ; on s'arrête AVANT de dépasser les accès autorisés."""
     from .enablebanking import EnableBankingError, is_pending, pick_balance, to_raw
@@ -174,12 +175,12 @@ def eb_sync_account(db: Database, eb, acc, today: date | None = None, lookback_d
         new = db.upsert_transactions(parsed)
         # solde : une fois par jour (ou si jamais lu), et seulement s'il reste du quota
         bal_today = db.get_meta(f"bal:{acc_id}") == today.isoformat()
-        if (not bal_today or acc["balance"] is None) and accesses_today(db, acc_id, today) < limit:
+        if (not bal_today or acc["balance"] is None or force_balance) and accesses_today(db, acc_id, today) < limit:
             try:
                 _count_access(db, acc_id, today)
                 bal = pick_balance(eb.balances(acc_id))
                 if bal:
-                    db.set_balance(acc_id, bal[0], bal[1])
+                    db.set_balance(acc_id, bal[0], bal[1], read=True)
                     db.set_meta(f"bal:{acc_id}", today.isoformat())
                 else:
                     db.set_balance(acc_id, acc["balance"], acc["balance_date"])
@@ -218,8 +219,10 @@ def sync_status(db: Database, today: date | None = None) -> list[dict]:
         if a["institution_id"] in ("DEMO", "CSV") or not a["id"]:
             continue
         used = accesses_today(db, a["id"], today)
+        eff = db.effective_balance(a["id"])
         out.append({"account_id": a["id"], "bank": a["bank"], "name": a["name"], "ignored": bool(a["ignored"]),
                     "last_sync": a["last_sync"], "balance": a["balance"], "balance_date": a["balance_date"],
+                    "balance_read_at": eff["read_at"], "balance_estimate": eff["estimate"], "balance_delta": eff["delta"],
                     "balance_read_today": db.get_meta(f"bal:{a['id']}") == today.isoformat(),
                     "used": used, "limit": limit, "remaining": max(0, limit - used)})
     return out
@@ -240,6 +243,33 @@ def sync_accounts(db: Database, lookback_days: int | None = None) -> tuple[list[
     return eb_sync_all(db, client, lookback_days)
 
 
+def mark_internal_pairs(db: Database, since: date | None = None, window_days: int = 2) -> int:
+    """Un crédit sur un compte et un débit du même montant sur un AUTRE de tes comptes, à ≤ 2 jours,
+    tous deux libellés comme des virements → virement interne des deux côtés, quel que soit le libellé."""
+    from .categorize import TRANSFER_RX
+
+    since = since or (date.today() - timedelta(days=45))
+    txs = [t for t in db.transactions(since=since) if TRANSFER_RX.search(f"{t.counterparty} {t.label}".lower())]
+    credits = [t for t in txs if t.amount > 0]
+    debits = [t for t in txs if t.amount < 0]
+    used: set[str] = set()
+    n = 0
+    for c in credits:
+        for d in debits:
+            if d.id in used or d.account_id == c.account_id or abs(abs(d.amount) - c.amount) > 0.005:
+                continue
+            if abs((d.booking_date - c.booking_date).days) > window_days:
+                continue
+            used.add(d.id)
+            for t in (c, d):
+                if t.category != "epargne_virement":
+                    db.set_category(t.id, "epargne_virement")
+                    n += 1
+            break
+    db.commit()
+    return n
+
+
 def recategorize_all(db: Database) -> int:
     from .importer import counterparty_from_label
 
@@ -254,4 +284,4 @@ def recategorize_all(db: Database) -> int:
             db.set_category(tx.id, c)
             n += 1
     db.commit()
-    return n
+    return n + mark_internal_pairs(db, since=date.today() - timedelta(days=400))

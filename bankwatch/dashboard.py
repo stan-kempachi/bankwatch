@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import calendar
 import hashlib
+import json
 import threading
 import time
 from collections import defaultdict
@@ -78,6 +79,11 @@ def _identify(request: Request) -> tuple[str, str] | None:
     if who:
         return who
     header = request.headers.get("authorization")
+    if header and header.lower().startswith("bearer "):
+        from . import tokens
+
+        app_name = tokens.verify(header[7:].strip())
+        return (f"app:{app_name}", "viewer") if app_name else None  # jeton d'application : lecture seule
     role = _check_basic(header)
     if role:
         user = base64.b64decode(header[6:]).decode("utf-8", "replace").partition(":")[0]
@@ -334,6 +340,11 @@ def summary():
     card_banks = {cs["card_bank"] for cs in _fc().card_settlements}
     for a in accounts:
         a["is_card"] = a["bank"] in card_banks
+        eff = db.effective_balance(a["id"])
+        a["balance_read"] = a["balance"]            # tel que lu à la banque
+        a["balance"] = eff["estimate"] if eff["estimate"] is not None else a["balance"]  # estimé (lecture + opérations vues depuis)
+        a["balance_delta"] = eff["delta"]
+        a["balance_read_at"] = eff["read_at"]
     return {
         "today": today.isoformat(),
         "accounts": accounts,
@@ -560,8 +571,13 @@ def sync_one(account_id: str, request: Request):
             eb = EnableBankingClient()
         except EnableBankingError as e:
             return JSONResponse({"error": str(e)}, 400)
-        r, new = eb_sync_account(db, eb, acc)
+        r, new = eb_sync_account(db, eb, acc, force_balance=True)
         alerts = run_checks(db, new, notify=True) if new else []
+        if new:
+            from .webhooks import emit_sync_completed, load_subscribers
+
+            if load_subscribers():
+                threading.Thread(target=emit_sync_completed, args=([r], len(new)), daemon=True).start()
         st = next(s for s in sync_status(db) if s["account_id"] == account_id)
         return {"ok": r.error is None and not r.skipped, "new": r.new_count, "error": r.error, "skipped": r.skipped,
                 "rate_limited": r.rate_limited, "alerts": len(alerts), "status": st}
@@ -615,6 +631,75 @@ def transactions(days: int = Query(30, ge=1, le=400), account: str | None = None
         rows.append(_tx_row(t, accounts))
     total = round(sum(r["amount"] for r in rows), 2)
     return {"items": rows[:limit], "count": len(rows), "total": total}
+
+
+# ----------------------------------------------------------------------------- export (autres applis)
+# Schéma stable, pensé pour les applications abonnées (budget du foyer…) : authentification par jeton
+# Bearer (`bankwatch token create <appli>`), lecture seule. Voir docs/INTEGRATION.md.
+
+def _pro_banks() -> set[str]:
+    from .forecast import FORECAST_FILE
+
+    try:
+        raw = json.loads(FORECAST_FILE.read_text(encoding="utf-8")) if FORECAST_FILE.exists() else {}
+    except json.JSONDecodeError:
+        raw = {}
+    return {b for b, c in (raw.get("accounts") or {}).items() if isinstance(c, dict) and c.get("pro")}
+
+
+@app.get("/api/export/accounts")
+def export_accounts(include_ignored: bool = False):
+    """Comptes suivis, avec IBAN complet (pour que l'appli abonnée reconnaisse ses virements internes)."""
+    db = _db()
+    pro = _pro_banks()
+    out = []
+    for a in db.accounts(include_ignored=include_ignored):
+        eff = db.effective_balance(a["id"])
+        out.append({
+            "id": a["id"], "bank": a["bank"], "name": a["name"] or "", "iban": a["iban"] or "",
+            "currency": a["currency"] or "EUR", "pro": a["bank"] in pro, "ignored": bool(a["ignored"]),
+            "balance": eff["balance"], "balance_estimate": eff["estimate"], "balance_read_at": eff["read_at"],
+            "last_sync": a["last_sync"],
+        })
+    return {"accounts": out, "generated_at": datetime.now().isoformat(timespec="seconds")}
+
+
+@app.get("/api/export/transactions")
+def export_transactions(since: date | None = None, until: date | None = None, account: str | None = None,
+                        status: str | None = Query(None, pattern="^(booked|pending)$"),
+                        include_ignored: bool = False, limit: int = Query(5000, le=20000)):
+    """Opérations (par défaut 90 jours) avec la catégorie BankWatch et le marqueur de virement interne."""
+    db = _db()
+    today = date.today()
+    txs = db.transactions(since=since or today - timedelta(days=90), until=until, account_id=account,
+                          include_ignored=include_ignored)
+    banks = {a["id"]: a["bank"] for a in db.accounts()}
+    items = []
+    for t in txs:
+        if status and t.status != status:
+            continue
+        items.append({
+            "id": t.id, "account_id": t.account_id, "bank": banks.get(t.account_id, "?"),
+            "booking_date": t.booking_date.isoformat(),
+            "value_date": t.value_date.isoformat() if t.value_date else None,
+            "amount": t.amount, "currency": t.currency, "counterparty": t.counterparty, "label": t.label,
+            "category": t.category or "autre", "status": t.status,
+            "internal": t.category == "epargne_virement", "merchant_key": t.merchant_key,
+            "counter_iban": _counter_iban(t.raw),
+        })
+    return {"items": items[:limit], "count": len(items), "since": (since or today - timedelta(days=90)).isoformat(),
+            "categories": sorted({i["category"] for i in items})}
+
+
+def _counter_iban(raw: dict) -> str:
+    """IBAN de la contrepartie quand la banque le fournit (format Enable Banking), sinon ''."""
+    if not isinstance(raw, dict):
+        return ""
+    for k in ("creditor_account", "debtor_account"):
+        acc = raw.get(k) or {}
+        if isinstance(acc, dict) and acc.get("iban"):
+            return str(acc["iban"]).replace(" ", "")
+    return ""
 
 
 @app.get("/api/transaction/{tx_id:path}")

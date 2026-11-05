@@ -331,3 +331,29 @@ def test_custom_rules_ignore_comments(tmp_path):
     p = tmp_path / "c.json"
     p.write_text('{"_comment": "ceci est un commentaire", "perso": ["x"], "bidon": "pas une liste"}')
     assert load_custom(p) == {"perso": ["x"]}
+
+
+def test_generic_counterparty_transfer_is_internal():
+    c = Categorizer(owner_names=["Alice Martin"], custom={})
+    assert c.categorize("EN LIGNE OPE: DE: Compte MOTIF", "VIREMENT EN LIGNE OPE: 0320 DE: Compte MOTIF:", 50) == "epargne_virement"
+    assert c.categorize("EN LIGNE REF: REMISE", "VIREMENT EN LIGNE REF: 0320 REMISE:0320", -50) == "epargne_virement"
+    assert c.categorize("Jean Dupont", "VIREMENT remboursement", 700) == "revenus"  # vraie contrepartie : pas interne
+
+
+def test_internal_pairs_across_accounts(tmp_path):
+    from bankwatch.sync import mark_internal_pairs
+
+    db = Database(tmp_path / "t.db")
+    for acc in ("s1", "s2", "b1"):
+        db.upsert_account(id=acc, bank="x", institution_id="X", requisition_id=None, iban=None, name=acc, currency="EUR")
+    db.upsert_transactions([
+        Tx(id="s1:c", account_id="s1", booking_date=date(2026, 11, 5), amount=50, counterparty="QUELQUE CHOSE", label="VIREMENT EN LIGNE", category="revenus", status="pending"),
+        Tx(id="s2:d", account_id="s2", booking_date=date(2026, 11, 5), amount=-50, counterparty="AUTRE", label="VIREMENT EN LIGNE", category="autre", status="pending"),
+        Tx(id="b1:x", account_id="b1", booking_date=date(2026, 11, 5), amount=-50, counterparty="CARREFOUR", label="CB CARREFOUR", category="courses"),  # même montant, pas un virement
+        Tx(id="s1:far", account_id="s1", booking_date=date(2026, 10, 20), amount=50, counterparty="CLIENT", label="VIREMENT facture", category="revenus"),  # trop loin
+    ])
+    assert mark_internal_pairs(db, since=date(2026, 10, 1)) == 2
+    cats = {t.id: t.category for t in db.transactions(include_ignored=True)}
+    assert cats["s1:c"] == cats["s2:d"] == "epargne_virement"
+    assert cats["b1:x"] == "courses" and cats["s1:far"] == "revenus"
+    assert mark_internal_pairs(db, since=date(2026, 10, 1)) == 0  # idempotent

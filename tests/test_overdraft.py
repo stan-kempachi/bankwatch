@@ -80,3 +80,22 @@ def test_rate_calibrated_from_past_agios(tmp_path):
                                counterparty="INTERETS DEBITEURS", label="AGIOS 3E TRIMESTRE", status="booked")])
     r = calibrate_rate(db, "s1", -125.81, date(2026, 11, 4))
     assert r is not None and 0.3 < r < 0.8  # ~1 € d'agios sur ~6 j × 100 € : taux élevé mais cohérent avec les données
+
+
+def test_effective_balance_adds_ops_seen_since_read(tmp_path):
+    db = Database(tmp_path / "e.db")
+    db.upsert_account(id="s1", bank="sg", institution_id="X", requisition_id=None, iban=None, name="c", currency="EUR")
+    db.set_balance("s1", -166.80, "2026-11-04", read=True)
+    db.set_meta("balread:s1", "2026-11-05T06:20:00+00:00")  # lecture du matin ; les virements arrivent plus tard
+    db.upsert_transactions([tx(1, "s1", date(2026, 11, 5), 170), Tx(id="s1:p", account_id="s1", booking_date=date(2026, 11, 5), amount=50,
+                                                                    counterparty="VIR", label="VIR", status="pending")])
+    e = db.effective_balance("s1")
+    assert e["balance"] == -166.80 and e["estimate"] == 53.2 and e["delta"] == 220 and e["since_count"] == 2
+    # le découvert disparaît avec l'estimation, et la prévision utilise le solde estimé
+    assert current_overdrafts(db, date(2026, 11, 5), CFG) == []
+    from bankwatch.forecast import ForecastConfig, coverage
+
+    assert {c.bank: c.balance for c in coverage(db, date(2026, 11, 5), ForecastConfig())}["sg"] == 53.2
+    # une nouvelle lecture remet le compteur à zéro
+    db.set_balance("s1", 53.2, "2026-11-05", read=True)
+    assert db.effective_balance("s1")["delta"] == 0

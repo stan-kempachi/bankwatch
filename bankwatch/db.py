@@ -220,12 +220,36 @@ class Database:
         )
         self.conn.commit()
 
-    def set_balance(self, account_id: str, balance: float, balance_date: str | None) -> None:
+    def set_balance(self, account_id: str, balance: float, balance_date: str | None, read: bool = False) -> None:
+        """`read=True` quand le solde vient d'être LU à la banque (et pas simplement recopié)."""
         self.conn.execute(
             "UPDATE accounts SET balance=?, balance_date=?, last_sync=? WHERE id=?",
             (balance, balance_date, _now(), account_id),
         )
+        if read:
+            self.conn.execute(
+                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (f"balread:{account_id}", _now()))
         self.conn.commit()
+
+    def balance_read_at(self, account_id: str) -> str | None:
+        return self.get_meta(f"balread:{account_id}")
+
+    def effective_balance(self, account_id: str) -> dict[str, Any]:
+        """Solde lu à la banque + opérations (y compris en attente) vues DEPUIS cette lecture.
+        Entre deux lectures (une par jour, quota DSP2), c'est le meilleur estimateur du solde réel."""
+        acc = self.conn.execute("SELECT balance, balance_date FROM accounts WHERE id=?", (account_id,)).fetchone()
+        base = float(acc["balance"]) if acc and acc["balance"] is not None else None
+        read_at = self.balance_read_at(account_id)
+        if base is None:
+            return {"balance": None, "estimate": None, "delta": 0.0, "read_at": read_at, "since_count": 0}
+        if not read_at:
+            return {"balance": base, "estimate": base, "delta": 0.0, "read_at": None, "since_count": 0}
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount),0) s, COUNT(*) n FROM transactions WHERE account_id=? AND first_seen > ?",
+            (account_id, read_at)).fetchone()
+        return {"balance": base, "estimate": round(base + row["s"], 2), "delta": round(row["s"], 2),
+                "read_at": read_at, "since_count": row["n"]}
 
     def accounts(self, include_ignored: bool = True) -> list[sqlite3.Row]:
         q = "SELECT * FROM accounts" + ("" if include_ignored else " WHERE ignored = 0")

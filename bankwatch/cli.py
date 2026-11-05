@@ -133,6 +133,7 @@ def sync(lookback: int = typer.Option(None, help="Jours d'historique à retirer 
         typer.echo(f"[{r.bank}] {r.account_id[:8]}… {_status(r)}")
     alerts = run_checks(db, new, notify=not no_notify)
     _print_alerts(alerts)
+    _notify_subscribers(results, new)
 
 
 @app.command("import")
@@ -195,6 +196,7 @@ def run():
         typer.echo(f"[{r.bank}] {r.account_id[:8]}… {_status(r)}")
     alerts = run_checks(db, new)
     _print_alerts(alerts)
+    _notify_subscribers(results, new)
     if should_send_weekly():
         send_report(db, 7)
         typer.echo("Rapport hebdo envoyé.")
@@ -262,6 +264,66 @@ def user_remove(name: str):
     from . import users
 
     typer.echo("Supprimé." if users.remove(name) else "Introuvable.")
+
+
+token_app = typer.Typer(help="Jetons d'API pour les autres applications (lecture seule, Bearer).", no_args_is_help=True)
+app.add_typer(token_app, name="token")
+
+
+@token_app.command("create")
+def token_create(name: str = typer.Argument(..., help="Nom de l'application (ex. budget)")):
+    """Crée ou remplace le jeton d'une application et l'affiche (une seule fois)."""
+    from . import tokens
+
+    try:
+        tok = tokens.create(name)
+    except ValueError as e:
+        typer.secho(str(e), fg="red")
+        raise typer.Exit(1)
+    typer.echo(f"Jeton « {name.strip().lower()} » : {tok}")
+    typer.echo("Stocké haché uniquement : copie-le maintenant dans la configuration de l'application.")
+
+
+@token_app.command("list")
+def token_list():
+    from . import tokens
+
+    for n, t in sorted(tokens.list_tokens().items()):
+        typer.echo(f"{n:15} créé le {t.get('created', '?')}")
+
+
+@token_app.command("revoke")
+def token_revoke(name: str):
+    from . import tokens
+
+    typer.echo("Révoqué." if tokens.revoke(name) else "Introuvable.")
+
+
+@app.command("webhook-test")
+def webhook_test():
+    """Envoie un événement de test à chaque abonné de rules/webhooks.json."""
+    from .webhooks import emit, load_subscribers
+
+    subs = [{**s, "events": ["*"]} for s in load_subscribers()]  # le ping ignore le filtre d'événements
+    if not subs:
+        typer.echo("Aucun abonné dans rules/webhooks.json.")
+        return
+    for r in emit("ping", {"message": "test BankWatch"}, subs):
+        typer.echo(f"{r['name']:15} {'OK' if r['ok'] else 'ÉCHEC'} {r.get('status') or ''} {r.get('error') or ''}")
+
+
+def _notify_subscribers(results, new) -> None:
+    """Prévient les applis abonnées (budget…) qu'une synchro vient d'avoir lieu. Jamais bloquant."""
+    from .webhooks import emit_sync_completed, load_subscribers
+
+    if not load_subscribers():
+        return
+    try:
+        for r in emit_sync_completed(results, len(new)):
+            if not r["ok"]:
+                typer.secho(f"webhook {r['name']} : {r.get('error')}", fg="yellow")
+    except Exception as e:  # noqa: BLE001 — un webhook cassé ne doit pas faire échouer la synchro
+        typer.secho(f"webhooks : {e}", fg="yellow")
 
 
 @app.command()

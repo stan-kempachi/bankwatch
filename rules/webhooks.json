@@ -1,0 +1,13 @@
+{
+  "_comment": "Applications prévenues après chaque synchro (CloudEvents signés HMAC, voir docs/INTEGRATION.md). Le secret est lu dans la variable d'environnement secret_env.",
+  "subscribers": [
+    {
+      "name": "budget",
+      "url": "http://127.0.0.1:8118/hooks/bankwatch",
+      "secret_env": "BW_WEBHOOK_SECRET_BUDGET",
+      "events": [
+        "sync.completed"
+      ]
+    }
+  ]
+}

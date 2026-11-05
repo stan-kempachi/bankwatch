@@ -115,7 +115,7 @@ def upcoming(db: Database, today: date | None = None, cfg: ForecastConfig | None
         card_accs = [a for a in db.accounts() if a["bank"] == cs["card_bank"]]
         if not debit_accs or not card_accs:
             continue
-        owed = sum(max(0.0, -(a["balance"] or 0)) for a in card_accs)
+        owed = sum(max(0.0, -(db.effective_balance(a["id"])["estimate"] or 0)) for a in card_accs)
         due = next_due_day(today, int(cs.get("due_day", 1)))
         if owed <= 0:
             continue
@@ -163,7 +163,8 @@ def coverage(db: Database, today: date | None = None, cfg: ForecastConfig | None
         if a["bank"] in {cs["card_bank"] for cs in cfg.card_settlements}:
             continue  # la carte elle-même n'a pas à être « couverte »
         mine = [u for u in ups if u.account_id == a["id"]]
-        out.append(Coverage(a["id"], a["bank"], a["name"] or "", float(a["balance"] or 0),
+        eff = db.effective_balance(a["id"])["estimate"]
+        out.append(Coverage(a["id"], a["bank"], a["name"] or "", float(eff if eff is not None else (a["balance"] or 0)),
                             [u for u in mine if not u.beyond], cfg.margin, later=[u for u in mine if u.beyond]))
     return out
 
