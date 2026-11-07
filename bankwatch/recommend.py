@@ -20,6 +20,7 @@ from .db import Database
 from .forecast import BANKS, Coverage, coverage, load_config
 from .overdraft import current_overdrafts
 from .rules import MEDIUM, Alert, eur
+from .sync import wallet_banks
 
 
 @dataclass
@@ -92,6 +93,8 @@ def analyse(db: Database, today: date | None = None) -> tuple[list[Need], list[S
     needs: list[Need] = []
     sources: list[Source] = []
     for acc_id, c in covs.items():
+        if _acc_cfg(raw, c.bank).get("wallet") or c.bank in wallet_banks():
+            continue  # portefeuille (PayPal) : ni besoin, ni source
         reasons = []
         need = 0.0
         if acc_id in ods:

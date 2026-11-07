@@ -17,7 +17,7 @@ DEFAULT_RULES: dict[str, list[str]] = {
                   "autoroute", "vinci", "sanef", "aprr", "parking", "indigo", "blablacar", "lime"],
     "logement": ["loyer", "edf", "engie", "totalenergies", "veolia", "suez", "free", "orange", "sfr",
                  "bouygues", "sosh", "red by", "assurance habitation", "syndic"],
-    "abonnements": ["netflix", "spotify", "disney", "amazon prime", "canal", "youtube", "apple.com",
+    "abonnements": ["netflix", "spotify", "disney", "crunchyroll", "paramount", "deezer", "amazon prime", "canal", "youtube", "apple.com",
                     "google storage", "icloud", "adobe", "notion", "github", "openai", "anthropic",
                     "ovh", "scaleway", "hetzner", "aws", "amazon web services", "cloudflare",
                     "microsoft", "dropbox", "basic-fit", "fitness", "salle de sport"],

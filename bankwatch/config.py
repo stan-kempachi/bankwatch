@@ -77,5 +77,17 @@ class Settings(BaseSettings):
     dashboard_max_failures: int = 10  # échecs avant blocage temporaire de l'IP
     dashboard_lockout_minutes: int = 15
 
+    # Assistant Discord (bankwatch chat) : salon(s) et utilisateurs autorisés, modèle Claude, plafond de tokens/jour
+    chat_channel_ids: str = ""        # ids de salons Discord séparés par des virgules
+    chat_owner_id: str = ""           # id Discord du propriétaire (valide les actions, modifie les règles)
+    chat_user_ids: str = ""           # autres ids autorisés à parler au bot
+    chat_models: str = "claude-sonnet-5-5,claude-haiku-5-5"  # liste de repli
+    chat_daily_token_cap: int = 300_000
+    chat_anthropic_api_key: str = ""
+    chat_anthropic_env_file: str = "" # fichier .env d'où lire ANTHROPIC_API_KEY si absent
+    chat_memory_path: Path = Path("data/chat_memoire.md")
+    chat_db_path: Path = Path("data/chat.db")
+    chat_budget_db: str = ""          # base SQLite de l'appli Budget du foyer (lecture seule), optionnel
+
 
 settings = Settings()

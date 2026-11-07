@@ -159,9 +159,12 @@ def coverage(db: Database, today: date | None = None, cfg: ForecastConfig | None
     cfg = cfg or load_config()
     ups = upcoming(db, today, cfg)
     out = []
+    from .sync import wallet_banks
+
+    skip = {cs["card_bank"] for cs in cfg.card_settlements} | wallet_banks()
     for a in db.accounts(include_ignored=False):
-        if a["bank"] in {cs["card_bank"] for cs in cfg.card_settlements}:
-            continue  # la carte elle-même n'a pas à être « couverte »
+        if a["bank"] in skip:
+            continue  # la carte elle-même, ou un portefeuille (PayPal) financé par la banque, n'a pas à être « couvert »
         mine = [u for u in ups if u.account_id == a["id"]]
         eff = db.effective_balance(a["id"])["estimate"]
         out.append(Coverage(a["id"], a["bank"], a["name"] or "", float(eff if eff is not None else (a["balance"] or 0)),

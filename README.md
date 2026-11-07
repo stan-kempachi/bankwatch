@@ -146,6 +146,16 @@ API de lecture `/api/export/accounts` et `/api/export/transactions` avec un jeto
 et webhooks **CloudEvents** signés HMAC après chaque synchro (`rules/webhooks.json`, `bankwatch webhook-test`).
 Détails et schémas dans [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
+## Discuter avec BankWatch dans Discord
+
+`bankwatch.chat` est un assistant conversationnel (API Claude) cantonné à un salon Discord : chaque message du salon est une question, sans mention ni préfixe. Seuls les utilisateurs listés sont écoutés.
+
+- Installation : `pip install -e ".[chat]"`, variables `BW_CHAT_*` dans `.env` (voir `.env.example`), service `deploy/bankwatch-chat.service`. Le token Discord est celui des alertes (`BW_DISCORD_TOKEN_FILE`).
+- Outils du modèle : état rapide (soldes lus et estimés, quota DSP2 du jour, alertes), requêtes SQL en lecture seule sur la base, lecture de `rules/` et `docs/`, commandes du CLI. Les commandes qui consomment du quota ou modifient des données (`sync`, `run`, `check`, `dismiss`, `dedupe`, `recategorize`, `ignore`, `report`) demandent un bouton ✅ au demandeur ou au propriétaire ; `link`, `user`, `token`, `import`, `reset` restent réservés au shell. La modification des fichiers de règles (JSON complet, sauvegarde dans `rules/.bak/`) est réservée au propriétaire, avec ✅.
+- En option, lecture seule de la base d'une autre appli (`BW_CHAT_BUDGET_DB`, ici l'appli Budget du foyer).
+- Mémoire durable dans `data/chat_memoire.md` (contexte du projet, éditable ; « retiens que … » y ajoute une ligne) ; historique par salon et compteur de tokens dans `data/chat.db`, plafond `BW_CHAT_DAILY_TOKEN_CAP`.
+- Mots-clés : `aide`, `reset` (oublie l'historique du salon), `usage`. Test sans Discord : `python -m bankwatch.chat --test "question"`.
+
 ## Synchronisation manuelle
 
 La carte « Synchronisation » montre, par compte, les accès consommés sur les 4 autorisés par jour, la dernière synchro et le prochain passage automatique. Le bouton **Synchroniser** (admin) lance la synchro d'un compte : il consomme 1 accès, est grisé quand le quota est épuisé, et déclenche les contrôles et alertes sur les nouvelles opérations.

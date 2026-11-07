@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -270,6 +271,57 @@ def mark_internal_pairs(db: Database, since: date | None = None, window_days: in
     return n
 
 
+WALLET_BANKS = {"paypal"}  # portefeuilles : leurs débits sont financés par un vrai compte bancaire
+
+
+def wallet_banks() -> set[str]:
+    """PayPal et tout compte marqué « wallet » dans rules/forecast.json (accounts.<banque>.wallet)."""
+    from .forecast import FORECAST_FILE
+
+    out = set(WALLET_BANKS)
+    try:
+        raw = json.loads(FORECAST_FILE.read_text(encoding="utf-8")) if FORECAST_FILE.exists() else {}
+    except json.JSONDecodeError:
+        raw = {}
+    out |= {b for b, c in (raw.get("accounts") or {}).items() if isinstance(c, dict) and c.get("wallet")}
+    return out
+
+
+def mark_wallet_pairs(db: Database, since: date | None = None, window_days: int = 3) -> int:
+    """Un achat PayPal existe deux fois : côté PayPal (avec le marchand) et côté banque (« PRÉLÈVEMENT PayPal »
+    ou « CARTE PAYPAL *X »). La ligne bancaire de même montant à ≤ 3 jours devient un virement interne vers le
+    portefeuille ; la ligne PayPal garde la dépense et sa catégorie. Si PayPal remonte aussi l'alimentation
+    (crédit du même montant), elle est interne elle aussi. Sans jumeau côté PayPal, la ligne banque reste comptée."""
+    wallets = {a["id"]: a["bank"] for a in db.accounts(include_ignored=False) if a["bank"] in wallet_banks()}
+    if not wallets:
+        return 0
+    since = since or (date.today() - timedelta(days=45))
+    txs = db.transactions(since=since)
+    wallet_txs = [t for t in txs if t.account_id in wallets]
+    names = set(wallets.values())
+    bank_txs = [t for t in txs if t.account_id not in wallets and t.amount < 0
+                and any(w in f"{t.counterparty} {t.label}".lower() for w in names)]
+    used: set[str] = set()
+    n = 0
+    for b in sorted(bank_txs, key=lambda t: t.booking_date):
+        cands = [w for w in wallet_txs if w.id not in used and abs(abs(w.amount) - abs(b.amount)) <= 0.005
+                 and abs((w.booking_date - b.booking_date).days) <= window_days]
+        if not cands:
+            continue
+        # alimentation (crédit) d'abord, sinon l'achat lui-même ; au plus proche en date
+        cands.sort(key=lambda w: (w.amount < 0, abs((w.booking_date - b.booking_date).days)))
+        w = cands[0]
+        used.add(w.id)
+        if b.category != "epargne_virement":
+            db.set_category(b.id, "epargne_virement")
+            n += 1
+        if w.amount > 0 and w.category != "epargne_virement":
+            db.set_category(w.id, "epargne_virement")
+            n += 1
+    db.commit()
+    return n
+
+
 def recategorize_all(db: Database) -> int:
     from .importer import counterparty_from_label
 
@@ -284,4 +336,5 @@ def recategorize_all(db: Database) -> int:
             db.set_category(tx.id, c)
             n += 1
     db.commit()
-    return n + mark_internal_pairs(db, since=date.today() - timedelta(days=400))
+    since = date.today() - timedelta(days=400)
+    return n + mark_internal_pairs(db, since=since) + mark_wallet_pairs(db, since=since)

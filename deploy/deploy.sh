@@ -4,5 +4,5 @@ set -euo pipefail
 cd /home/pi/apps/bankwatch
 git pull --ff-only
 .venv/bin/pip install -q -e .
-sudo systemctl restart bankwatch.service
+sudo systemctl restart bankwatch.service bankwatch-chat.service
 echo "OK — $(git log -1 --format='%h %s')"

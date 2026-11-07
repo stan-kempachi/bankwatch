@@ -357,3 +357,54 @@ def test_internal_pairs_across_accounts(tmp_path):
     assert cats["s1:c"] == cats["s2:d"] == "epargne_virement"
     assert cats["b1:x"] == "courses" and cats["s1:far"] == "revenus"
     assert mark_internal_pairs(db, since=date(2026, 10, 1)) == 0  # idempotent
+
+
+# ---------------------------------------------------------------- portefeuille PayPal
+def _wallet_db(tmp_path):
+    from bankwatch.db import Database, Tx
+
+    db = Database(tmp_path / "w.db")
+    db.upsert_account(id="acc-bank", bank="boursobank", institution_id="X", requisition_id=None, iban="FR7611111", name="Courant", currency="EUR")
+    db.upsert_account(id="acc-pp", bank="paypal", institution_id="X", requisition_id=None, iban=None, name="PayPal", currency="EUR")
+    d = date(2026, 11, 2)
+
+    def tx(i, acc, amount, label, day=0, cp=""):
+        return Tx(id=i, account_id=acc, booking_date=d + timedelta(days=day), value_date=None, amount=amount,
+                  currency="EUR", counterparty=cp, label=label, category="autre", status="booked", raw={})
+
+    db.upsert_transactions([
+        tx("b1", "acc-bank", -16.99, "PRELEVEMENT EUROPEEN 3001676040 DE: PayPal Europe"),
+        tx("p1", "acc-pp", -16.99, "Crunchyroll", day=-1, cp="CRUNCHYROLL"),
+        tx("b2", "acc-bank", -164.0, "PRELEVEMENT EUROPEEN DE: PayPal Europe", day=3),   # pas (encore) de jumeau
+        tx("b3", "acc-bank", -25.0, "CARTE PAYPAL *VINTED", day=5),
+        tx("p3a", "acc-pp", 25.0, "Alimentation depuis BoursoBank", day=5),              # PayPal remonte l'alimentation…
+        tx("p3b", "acc-pp", -25.0, "Vinted", day=5, cp="VINTED"),                        # … puis l'achat
+        tx("b4", "acc-bank", -40.0, "CARTE LECLERC", day=5),                             # rien à voir
+    ])
+    db.commit()
+    return db
+
+
+def test_wallet_pairs(tmp_path):
+    from bankwatch.sync import mark_wallet_pairs
+
+    db = _wallet_db(tmp_path)
+    n = mark_wallet_pairs(db, since=date(2026, 10, 1))
+    cats = {t.id: t.category for t in db.transactions(since=date(2026, 10, 1))}
+    assert cats["b1"] == "epargne_virement" and cats["p1"] == "autre"       # la dépense reste côté PayPal
+    assert cats["b2"] == "autre"                                             # sans jumeau : comptée côté banque
+    assert cats["b3"] == "epargne_virement" and cats["p3a"] == "epargne_virement" and cats["p3b"] == "autre"
+    assert cats["b4"] == "autre"
+    assert n == 3
+    assert mark_wallet_pairs(db, since=date(2026, 10, 1)) == 0            # idempotent
+
+
+def test_wallet_excluded_from_coverage_and_recommendations(tmp_path):
+    from bankwatch.forecast import coverage
+    from bankwatch.recommend import detect_recommendations
+
+    db = _wallet_db(tmp_path)
+    db.set_balance("acc-bank", 500.0, date(2026, 11, 6))
+    db.set_balance("acc-pp", 0.0, date(2026, 11, 6))
+    assert {c.bank for c in coverage(db, today=date(2026, 11, 6))} == {"boursobank"}
+    assert all("paypal" not in (a.message or "").lower() for a in detect_recommendations(db, date(2026, 11, 6)))

@@ -26,9 +26,10 @@ def run_checks(db: Database, new_txs: list[Tx] | None = None, today: date | None
                notify: bool = True) -> list[Alert]:
     """Évalue les règles sur les transactions récentes et notifie les alertes nouvelles."""
     today = today or date.today()
-    from .sync import mark_internal_pairs
+    from .sync import mark_internal_pairs, mark_wallet_pairs
 
     mark_internal_pairs(db, since=today - timedelta(days=45))
+    mark_wallet_pairs(db, since=today - timedelta(days=45))
     history = db.transactions(since=today - timedelta(days=400))
     cutoff = today - timedelta(days=CANDIDATE_WINDOW_DAYS)
     if new_txs is None:
