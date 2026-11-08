@@ -334,7 +334,7 @@ ConfirmFn = Callable[[str, str], Awaitable[bool]]  # (titre, détail) -> validé
 
 def system_prompt(authors: str) -> str:
     now = datetime.now(TZ)
-    return f"""Tu es l'assistant BankWatch, dans le salon Discord #budget du foyer. Nous sommes le {now:%A %d %B %Y, %H:%M} (Paris).
+    return f"""Tu es l'assistant de cette instance BankWatch, dans son salon Discord dédié. Nous sommes le {now:%A %d %B %Y, %H:%M} (Paris).
 
 Périmètre : BankWatch (surveillance des comptes bancaires : soldes, opérations, alertes, prévisions de prélèvements, recommandations de virements, règles de catégorisation, commandes du CLI) et, en lecture seule, l'appli « Budget du foyer » (postes, prévu/réel par mois, règles de classement). Pour tout autre sujet, réponds en une phrase que tu es cantonné à BankWatch et au budget.
 

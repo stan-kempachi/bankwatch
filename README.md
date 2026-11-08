@@ -146,6 +146,17 @@ API de lecture `/api/export/accounts` et `/api/export/transactions` avec un jeto
 et webhooks **CloudEvents** signés HMAC après chaque synchro (`rules/webhooks.json`, `bankwatch webhook-test`).
 Détails et schémas dans [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
+## Une instance par personne
+
+BankWatch est mono-utilisateur par conception : une base, un `.env`, un jeu de consentements. Pour suivre les comptes d'une autre personne du foyer, on déploie une **seconde instance** plutôt que de mélanger les comptes :
+
+- second clone du dépôt (`apps_permanents/bankwatch-<prenom>`), son venv, son `data/` (droits 700) et son `.env` ;
+- la **même application Enable Banking** peut servir aux deux (même `BW_EB_APP_ID`, même `.pem`) : il faut ajouter la nouvelle *redirect URL* (`https://<instance>/callback`) dans le Control Panel et, en mode restreint, y **lier les comptes de la personne** avant de lancer `bankwatch link` ;
+- un autre port (`8119`) dans le registre du proxy, un salon Discord propre (`BW_DISCORD_CHANNEL_ID`, `BW_CHAT_CHANNEL_IDS`), un timer décalé de 5 min (`deploy/bankwatch-<prenom>-run.timer`) ;
+- côté Budget du foyer, l'instance est déclarée comme source supplémentaire (`flask configure --source <prenom> --owner N …`) et son `rules/webhooks.json` pointe sur `/hooks/bankwatch?source=<prenom>`.
+
+Les unités systemd de la seconde instance sont dans `deploy/bankwatch-<prenom>*` (dépôt privé uniquement).
+
 ## Discuter avec BankWatch dans Discord
 
 `bankwatch.chat` est un assistant conversationnel (API Claude) cantonné à un salon Discord : chaque message du salon est une question, sans mention ni préfixe. Seuls les utilisateurs listés sont écoutés.
