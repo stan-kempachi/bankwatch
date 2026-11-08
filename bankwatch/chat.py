@@ -156,7 +156,7 @@ def usage_add(inp: int, out: int) -> None:
 FREE_CMDS = {"accounts", "alerts", "forecast", "watch", "institutions"}
 FREE_SUBCMDS = {("user", "list"), ("token", "list")}
 CONFIRM_CMDS = {"sync", "run", "check", "dismiss", "dedupe", "recategorize", "ignore", "report",
-                "notify-test", "webhook-test"}
+                "notify-test", "webhook-test", "link"}
 RULE_FILES = {"categories.json", "forecast.json", "overdraft.json", "watch.json"}
 SQL_FORBIDDEN = re.compile(r"\b(attach|detach|pragma|insert|update|delete|drop|alter|create|replace|vacuum|reindex)\b", re.I)
 
@@ -315,7 +315,7 @@ def t_etat() -> str:
 TOOLS: list[dict[str, Any]] = [
     {"name": "etat", "description": "Photo rapide de BankWatch : solde lu et estimé par compte, quota DSP2 consommé aujourd'hui, alertes récentes, dernier passage. À appeler en premier pour « où j'en suis ? ».",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "bankwatch_cmd", "description": "Exécute une commande du CLI bankwatch. Sans validation : accounts, alerts [--all], forecast, watch, institutions <nom>, report --dry-run, user list, token list. Avec bouton ✅ de l'utilisateur : sync (consomme du quota DSP2 : 1 accès transactions par compte, +1 si relecture de solde), run (sync+contrôles+alertes), check [--no-notify], dismiss <n°>, dedupe, recategorize, ignore <id>, report --days N, notify-test, webhook-test. Tout le reste est refusé.",
+    {"name": "bankwatch_cmd", "description": "Exécute une commande du CLI bankwatch. Sans validation : accounts, alerts [--all], forecast, watch, institutions <nom>, report --dry-run, user list, token list. Avec bouton ✅ de l'utilisateur : sync (consomme du quota DSP2 : 1 accès transactions par compte, +1 si relecture de solde), run (sync+contrôles+alertes), check [--no-notify], dismiss <n°>, dedupe, recategorize, ignore <id>, report --days N, notify-test, webhook-test, link <nom-court> \"<ASPSP>\" [--business] (génère un lien de consentement bancaire à transmettre à l'utilisateur ; ne consomme pas de quota). Tout le reste est refusé.",
      "input_schema": {"type": "object", "properties": {"args": {"type": "string", "description": "arguments après `bankwatch`, ex. `alerts --all` ou `dismiss 12`"}}, "required": ["args"]}},
     {"name": "bankwatch_sql", "description": "Requête SELECT en lecture seule sur la base BankWatch (SQLite). Tables : accounts(id,bank,name,iban,balance,balance_date,last_sync,ignored), transactions(id,account_id,booking_date,value_date,amount,counterparty,label,category,status[booked|pending],first_seen ; NE PAS sélectionner la colonne raw), alerts(id,kind,severity,title,message,amount,tx_ids,created_at,sent_at,dismissed), meta(key,value). Montants : débit négatif. Dates ISO. 200 lignes max.",
      "input_schema": {"type": "object", "properties": {"sql": {"type": "string"}}, "required": ["sql"]}},
