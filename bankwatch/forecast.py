@@ -140,17 +140,21 @@ def upcoming(db: Database, today: date | None = None, cfg: ForecastConfig | None
             continue
         if any(t in f"{last.counterparty} {last.label}".lower() for t in settle_terms):
             continue  # déjà couvert par le règlement de carte
+        # plusieurs lignes le même jour (ex. deux forfaits Bouygues) : un seul prélèvement, montant cumulé ;
+        # les écarts nuls sont ignorés pour la cadence, sinon cadence 0 → boucle infinie
         gaps = [(b.booking_date - a.booking_date).days for a, b in zip(items, items[1:], strict=False)]
-        cadence = sorted(gaps)[len(gaps) // 2] if gaps else 30
+        gaps = [g for g in gaps if g > 0]
+        cadence = max(1, sorted(gaps)[len(gaps) // 2]) if gaps else 30
+        amount = sum(abs(t.amount) for t in items if t.booking_date == last.booking_date) or abs(last.amount)
         if 27 <= cadence <= 32:  # mensuel : même jour du mois que la dernière occurrence
             due = next_due_day(max(today, last.booking_date + timedelta(days=1)), last.booking_date.day)
         else:
             due = last.booking_date + timedelta(days=cadence)
-            while due < today:
-                due += timedelta(days=cadence)
+            if due < today:
+                due += timedelta(days=cadence * (((today - due).days // cadence) + 1))
         if due <= horizon:
             out.append(Upcoming(last.account_id, accounts[last.account_id]["bank"],
-                                due, last.counterparty or last.label, round(abs(last.amount), 2), "recurring"))
+                                due, last.counterparty or last.label, round(amount, 2), "recurring"))
     out.sort(key=lambda u: (u.due, -u.amount))
     return out
 

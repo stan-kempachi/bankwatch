@@ -101,3 +101,18 @@ def test_card_beyond_horizon_shown_as_later_without_alert(tmp_path):
     assert b.ok and b.shortfall == 0
     assert b.projected_shortfall == round(149.68 + 50 - 121.54, 2)
     assert detect_forecast(db, today, CFG) == []  # pas d'alerte avant la fenêtre
+
+
+def test_two_lines_same_day_do_not_loop_forever(tmp_path):
+    """Deux prélèvements du même marchand le même jour chaque mois (ex. deux forfaits Bouygues) :
+    écarts 0/30/0/30 → la cadence médiane valait 0 et la boucle de report ne finissait jamais."""
+    db = setup(tmp_path)
+    rows = []
+    for i, m in enumerate((6, 7, 8, 9, 10)):
+        for j, amt in enumerate((-20.0, -23.99)):
+            rows.append(Tx(id=f"bt{i}{j}", account_id="s1", booking_date=date(2026, m, 19), amount=amt,
+                           counterparty="Bouygues Telecom", label="PRLV BOUYGUES", category="abonnements"))
+    db.upsert_transactions(rows)
+    ups = upcoming(db, date(2026, 11, 8), ForecastConfig(horizon_days=14, margin=50, card_settlements=[]))
+    bt = [u for u in ups if "Bouygues" in u.label]
+    assert len(bt) == 1 and bt[0].due == date(2026, 11, 19) and bt[0].amount == 43.99

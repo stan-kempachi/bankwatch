@@ -267,14 +267,24 @@ class Database:
         now = _now()
         for tx in txs:
             exists = self.conn.execute(
-                "SELECT status FROM transactions WHERE id=?", (tx.id,)
+                "SELECT status, amount FROM transactions WHERE id=?", (tx.id,)
             ).fetchone()
+            if exists and abs((exists["amount"] or 0) - tx.amount) > 0.005 and not (
+                    exists["status"] == "pending" and tx.status == "booked"):
+                # Même référence, montant différent : deux opérations distinctes (PayPal renvoie l'achat −X et
+                # son alimentation +X sous le même identifiant). On garde la première telle quelle et on
+                # suffixe la seconde par son sens, de façon stable d'une synchro à l'autre.
+                tx.id = f"{tx.id}:{'c' if tx.amount > 0 else 'd'}"
+                exists = self.conn.execute(
+                    "SELECT status, amount FROM transactions WHERE id=?", (tx.id,)
+                ).fetchone()
             if exists:
-                if exists["status"] != tx.status:
+                if exists["status"] != tx.status or abs((exists["amount"] or 0) - tx.amount) > 0.005:
+                    # passage en attente → comptabilisé : le montant peut bouger (pourboire, pré-autorisation)
                     self.conn.execute(
-                        "UPDATE transactions SET status=?, booking_date=?, value_date=? WHERE id=?",
+                        "UPDATE transactions SET status=?, booking_date=?, value_date=?, amount=? WHERE id=?",
                         (tx.status, tx.booking_date.isoformat(),
-                         tx.value_date.isoformat() if tx.value_date else None, tx.id),
+                         tx.value_date.isoformat() if tx.value_date else None, tx.amount, tx.id),
                     )
                 continue
             if tx.status == "booked":

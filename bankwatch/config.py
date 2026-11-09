@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     chat_memory_path: Path = Path("data/chat_memoire.md")
     chat_db_path: Path = Path("data/chat.db")
     chat_budget_db: str = ""          # base SQLite de l'appli Budget du foyer (lecture seule), optionnel
+    chat_instances_file: Path = Path("data/chat_instances.json")  # plusieurs BankWatch vus par le même bot (optionnel)
+    chat_backend: str = "api"         # "api" (clé Anthropic) ou "claude-code" (abonnement, via `claude -p`)
+    chat_cc_bin: str = "claude"       # binaire Claude Code
+    chat_cc_model: str = "sonnet"     # alias de modèle passé à claude --model
+    chat_cc_max_turns: int = 12
+    chat_cc_timeout: int = 600        # s — inclut l'attente d'une validation ✅ (5 min)
+    chat_mcp_port: int = 8121         # serveur MCP HTTP local hébergé par le bot
 
 
 settings = Settings()

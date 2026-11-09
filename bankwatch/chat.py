@@ -33,6 +33,8 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 
+from dataclasses import dataclass
+
 from .config import settings
 
 log = logging.getLogger("bankwatch.chat")
@@ -84,6 +86,69 @@ MEMOIRE = Path(settings.chat_memory_path)
 CHAT_DB = Path(settings.chat_db_path)
 BUDGET_DB = Path(settings.chat_budget_db) if settings.chat_budget_db else None
 BANKWATCH_BIN = Path(sys.executable).parent / "bankwatch"
+
+# --------------------------------------------------------------------------- instances
+
+
+@dataclass(frozen=True)
+class Instance:
+    """Une installation BankWatch (dossier, venv, base) visible depuis le bot."""
+
+    id: str
+    root: Path
+    label: str
+    users: frozenset[int]  # ids Discord des personnes dont c'est l'instance
+
+    @property
+    def bin(self) -> Path:
+        b = self.root / ".venv" / "bin" / "bankwatch"
+        return b if b.exists() else BANKWATCH_BIN
+
+    @property
+    def db(self) -> Path:
+        v = _env_file_value(str(self.root / ".env"), "BW_DB_PATH")
+        q = Path(v) if v else Path("data/bankwatch.db")
+        return q if q.is_absolute() else self.root / q
+
+    @property
+    def mine(self) -> bool:
+        return self.root == ROOT
+
+
+def load_instances() -> dict[str, "Instance"]:
+    """data/chat_instances.json : {"stan": {"root": "/…/bankwatch", "label": "…", "users": ["<id>"]}, …}.
+    Sans fichier : une seule instance, celle du dépôt courant."""
+    path = Path(settings.chat_instances_file)
+    if not path.is_absolute():
+        path = ROOT / path
+    if not path.exists():
+        return {"default": Instance("default", ROOT, "BankWatch", frozenset(ALLOWED_IDS))}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    out: dict[str, Instance] = {}
+    for key, spec in raw.items():
+        root = Path(spec["root"]).expanduser().resolve()
+        if not (root / "bankwatch").is_dir():
+            raise SystemExit(f"instance {key} : {root} n'est pas un dépôt BankWatch")
+        out[key] = Instance(key, root, spec.get("label") or f"BankWatch {key}",
+                            frozenset(int(u) for u in spec.get("users", [])))
+    if not out:
+        raise SystemExit(f"{path} ne déclare aucune instance")
+    return out
+
+
+INSTANCES = load_instances()
+MULTI = len(INSTANCES) > 1
+
+
+def instance_for(author_id: int | None, requested: str | None) -> "Instance":
+    if requested:
+        if requested not in INSTANCES:
+            raise Refused(f"instance inconnue : {requested} (connues : {', '.join(INSTANCES)})")
+        return INSTANCES[requested]
+    for inst in INSTANCES.values():
+        if author_id is not None and author_id in inst.users:
+            return inst
+    return next(iter(INSTANCES.values()))
 
 # --------------------------------------------------------------------------- historique / usage
 
@@ -181,10 +246,13 @@ def classify_cmd(args: list[str]) -> str:
     raise Refused(f"`bankwatch {head}` n'est pas disponible depuis Discord (réservé au shell du Pi).")
 
 
-async def run_bankwatch(args: list[str], timeout: int = 240) -> str:
-    env = dict(os.environ, NO_COLOR="1", TERM="dumb", COLUMNS="110", PYTHONUNBUFFERED="1")
+async def run_bankwatch(args: list[str], inst: Instance, timeout: int = 240) -> str:
+    # le service charge le .env de SON instance dans l'environnement : on le retire pour que le CLI
+    # de l'instance visée relise son propre .env (pydantic-settings : environnement > env_file)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("BW_")}
+    env.update(NO_COLOR="1", TERM="dumb", COLUMNS="110", PYTHONUNBUFFERED="1")
     proc = await asyncio.create_subprocess_exec(
-        str(BANKWATCH_BIN), *args, cwd=str(ROOT), env=env,
+        str(inst.bin), *args, cwd=str(inst.root), env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -225,8 +293,8 @@ def _ro_query(db: Path, sql: str, max_rows: int = 200) -> str:
     return text[:5000] + ("\n… (tronqué)" if len(text) > 5000 else "")
 
 
-def t_bankwatch_sql(sql: str) -> str:
-    return _ro_query(Path(settings.db_path), sql)
+def t_bankwatch_sql(sql: str, inst: Instance) -> str:
+    return _ro_query(inst.db, sql)
 
 
 def t_budget_sql(sql: str) -> str:
@@ -235,31 +303,31 @@ def t_budget_sql(sql: str) -> str:
     return _ro_query(BUDGET_DB, sql)
 
 
-def _safe_repo_path(rel: str, allowed_dirs: tuple[str, ...]) -> Path:
-    p = (ROOT / rel).resolve()
-    if not p.is_relative_to(ROOT) or p.name.startswith("."):
+def _safe_repo_path(rel: str, allowed_dirs: tuple[str, ...], root: Path = ROOT) -> Path:
+    p = (root / rel).resolve()
+    if not p.is_relative_to(root) or p.name.startswith("."):
         raise Refused("chemin refusé")
-    if p.name == "README.md" and p.parent == ROOT:
+    if p.name == "README.md" and p.parent == root:
         return p
-    if p.parent.name not in allowed_dirs or p.parent.parent != ROOT:
+    if p.parent.name not in allowed_dirs or p.parent.parent != root:
         raise Refused(f"lecture limitée à {', '.join(d + '/' for d in allowed_dirs)} et README.md")
     return p
 
 
-def t_fichier_lire(chemin: str) -> str:
-    p = _safe_repo_path(chemin, ("rules", "docs"))
+def t_fichier_lire(chemin: str, inst: Instance) -> str:
+    p = _safe_repo_path(chemin, ("rules", "docs"), inst.root)
     if not p.exists():
         raise Refused(f"{chemin} n'existe pas")
     text = p.read_text(encoding="utf-8")
     return text[:12000] + ("\n… (tronqué)" if len(text) > 12000 else "")
 
 
-def _rule_write(fichier: str, contenu: str) -> str:
+def _rule_write(fichier: str, contenu: str, inst: Instance) -> str:
     if fichier not in RULE_FILES:
         raise Refused(f"fichier de règles inconnu : {fichier} (attendu : {', '.join(sorted(RULE_FILES))})")
     data = json.loads(contenu)  # lève ValueError si invalide
-    path = ROOT / "rules" / fichier
-    bak = ROOT / "rules" / ".bak"
+    path = inst.root / "rules" / fichier
+    bak = inst.root / "rules" / ".bak"
     bak.mkdir(exist_ok=True)
     if path.exists():
         (bak / f"{path.stem}.{datetime.now(TZ):%Y%m%d_%H%M%S}.json").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -284,14 +352,16 @@ def t_memoire_ajouter(note: str) -> str:
     return "Noté dans la mémoire."
 
 
-def t_etat() -> str:
+def t_etat(inst: Instance) -> str:
     """Photo rapide : soldes (lus + estimés), quota du jour, alertes récentes, dernier passage."""
     from .db import Database
 
-    db = Database()
+    if not inst.db.exists():
+        raise Refused(f"base introuvable pour {inst.label}")
+    db = Database(inst.db)
     try:
         today = datetime.now(TZ).strftime("%Y-%m-%d")
-        lines = []
+        lines = [f"Instance : {inst.label} ({inst.id})"]
         for a in db.accounts(include_ignored=False):
             eb = db.effective_balance(a["id"])
             used = db.get_meta(f"access:{a['id']}:{today}", "0")
@@ -329,17 +399,40 @@ TOOLS: list[dict[str, Any]] = [
      "input_schema": {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]}},
 ]
 
+if MULTI:
+    _INSTANCE_PARAM = {"type": "string", "enum": list(INSTANCES),
+                       "description": "instance BankWatch visée (" + ", ".join(f"{k} = {v.label}" for k, v in INSTANCES.items())
+                       + ") ; par défaut celle de la personne qui parle"}
+    for _t in TOOLS:
+        if _t["name"] in ("etat", "bankwatch_cmd", "bankwatch_sql", "fichier_lire", "regle_ecrire"):
+            _t["input_schema"]["properties"]["instance"] = _INSTANCE_PARAM
+
 ConfirmFn = Callable[[str, str], Awaitable[bool]]  # (titre, détail) -> validé ?
+
+
+def instances_desc() -> str:
+    if not MULTI:
+        return ""
+    lines = ["Plusieurs installations BankWatch sont accessibles, une par personne :"]
+    for k, v in INSTANCES.items():
+        who = ", ".join(f"<@{u}>" for u in sorted(v.users)) or "personne en particulier"
+        lines.append(f"- `{k}` : {v.label} — instance de {who}")
+    lines.append("Chaque outil accepte `instance` ; sans précision, c'est l'instance de la personne qui parle. "
+                 "« Mes comptes » = l'instance de l'auteur du message. Quand une réponse mélange les deux, dis de quelle instance vient chaque chiffre. "
+                 "Le Budget du foyer est commun et fusionne les comptes des deux instances (colonne bank_accounts.session_id = bankwatch:<instance>). "
+                 f"Le propriétaire du bot est <@{OWNER_ID}> : il peut tout faire sur toutes les instances. "
+                 "Une autre personne ne peut lancer une action à validation (sync, run, dismiss…) que sur sa propre instance.")
+    return "\n".join(lines) + "\n"
 
 
 def system_prompt(authors: str) -> str:
     now = datetime.now(TZ)
-    return f"""Tu es l'assistant de cette instance BankWatch, dans son salon Discord dédié. Nous sommes le {now:%A %d %B %Y, %H:%M} (Paris).
+    return f"""Tu es l'assistant BankWatch de ce salon Discord. Nous sommes le {now:%A %d %B %Y, %H:%M} (Paris).
 
 Périmètre : BankWatch (surveillance des comptes bancaires : soldes, opérations, alertes, prévisions de prélèvements, recommandations de virements, règles de catégorisation, commandes du CLI) et, en lecture seule, l'appli « Budget du foyer » (postes, prévu/réel par mois, règles de classement). Pour tout autre sujet, réponds en une phrase que tu es cantonné à BankWatch et au budget.
 
 Interlocuteurs autorisés : {authors}. Les messages arrivent préfixés par [pseudo].
-
+{instances_desc()}
 Règles de travail :
 - Vérifie avant d'affirmer : utilise les outils (etat, SQL, commandes) plutôt que ta mémoire pour tout chiffre.
 - `sync`/`run` consomment le quota DSP2 (4 accès par compte et par jour, Swan/Indy strict) : regarde d'abord `etat` et dis combien il reste avant de proposer une synchro ; ne lance jamais une action à validation sans que l'utilisateur l'ait demandée.
@@ -371,7 +464,8 @@ class Agent:
         raise last or RuntimeError("aucun modèle disponible")
 
     async def run(self, scope: str, text: str, author: str, is_owner: bool, authors: str,
-                  confirm: ConfirmFn, progress: Callable[[str], Awaitable[None]] | None = None) -> str:
+                  confirm: ConfirmFn, progress: Callable[[str], Awaitable[None]] | None = None,
+                  author_id: int | None = None) -> str:
         inp, out = usage_today()
         if inp + out >= DAILY_CAP:
             return f"⛔ Plafond quotidien atteint ({inp + out:,} tokens / {DAILY_CAP:,}). Reprise demain, ou augmente BW_CHAT_DAILY_TOKEN_CAP."
@@ -390,7 +484,7 @@ class Agent:
                 break
             results = []
             for call in calls:
-                result = await self.tool(call.name, dict(call.input), is_owner, confirm, progress)
+                result = await self.tool(call.name, dict(call.input), is_owner, confirm, progress, author_id)
                 results.append({"type": "tool_result", "tool_use_id": call.id, "content": result})
             messages.append({"role": "user", "content": results})
         else:
@@ -400,35 +494,40 @@ class Agent:
         return final
 
     async def tool(self, name: str, args: dict[str, Any], is_owner: bool, confirm: ConfirmFn,
-                   progress: Callable[[str], Awaitable[None]] | None) -> str:
+                   progress: Callable[[str], Awaitable[None]] | None, author_id: int | None = None) -> str:
         try:
+            inst = instance_for(author_id, args.pop("instance", None))
+            tag = f"[{inst.label}] " if MULTI else ""
+            foreign = MULTI and author_id is not None and author_id not in inst.users
             if name == "etat":
-                return await asyncio.to_thread(t_etat)
+                return await asyncio.to_thread(t_etat, inst)
             if name == "bankwatch_sql":
-                return await asyncio.to_thread(t_bankwatch_sql, args["sql"])
+                return await asyncio.to_thread(t_bankwatch_sql, args["sql"], inst)
             if name == "budget_sql":
                 return await asyncio.to_thread(t_budget_sql, args["sql"])
             if name == "fichier_lire":
-                return t_fichier_lire(args["chemin"])
+                return t_fichier_lire(args["chemin"], inst)
             if name == "memoire_ajouter":
                 return t_memoire_ajouter(args["note"])
             if name == "regle_ecrire":
                 if not is_owner:
                     raise Refused("seul le propriétaire peut modifier les règles")
                 json.loads(args["contenu"])
-                if not await confirm(f"Modifier rules/{args['fichier']}", args.get("resume", "")):
+                if not await confirm(f"{tag}Modifier rules/{args['fichier']}", args.get("resume", "")):
                     raise Refused("modification non validée")
-                return _rule_write(args["fichier"], args["contenu"])
+                return _rule_write(args["fichier"], args["contenu"], inst)
             if name == "bankwatch_cmd":
                 argv = shlex.split(args["args"])
                 if argv and argv[0] == "bankwatch":
                     argv = argv[1:]
                 mode = classify_cmd(argv)
-                if mode == "confirm" and not await confirm(f"bankwatch {' '.join(argv)}", "Exécuter cette commande sur le Pi ?"):
+                if mode == "confirm" and foreign and not is_owner:
+                    raise Refused(f"action sur {inst.label} : seul le propriétaire peut la lancer")
+                if mode == "confirm" and not await confirm(f"{tag}bankwatch {' '.join(argv)}", "Exécuter cette commande sur le serveur ?"):
                     raise Refused("commande non validée")
                 if progress and mode == "confirm":
-                    await progress(f"⏳ `bankwatch {' '.join(argv)}` en cours…")
-                return await run_bankwatch(argv)
+                    await progress(f"⏳ {tag}`bankwatch {' '.join(argv)}` en cours…")
+                return await run_bankwatch(argv, inst)
             return f"outil inconnu : {name}"
         except Refused as e:
             return f"REFUSÉ : {e}"
@@ -437,6 +536,33 @@ class Agent:
         except Exception as e:  # noqa: BLE001 — on renvoie l'erreur au modèle plutôt que de planter le bot
             log.exception("outil %s", name)
             return f"ERREUR interne : {type(e).__name__}: {e}"
+
+
+def make_agent():
+    """Agent API (historique) ou Claude Code selon BW_CHAT_BACKEND."""
+    if settings.chat_backend == "claude-code":
+        from .chat_cc import CCAgent
+
+        return CCAgent()
+    return Agent()
+
+
+async def start_backend() -> None:
+    """Démarre ce dont le backend a besoin dans la boucle courante (serveur MCP pour Claude Code)."""
+    if settings.chat_backend == "claude-code":
+        from .chat_cc import serve_mcp
+
+        asyncio.get_running_loop().create_task(serve_mcp(), name="bankwatch-mcp")
+        await asyncio.sleep(0.5)
+
+
+def forget_scope(scope: str) -> int:
+    n = history_clear(scope)
+    if settings.chat_backend == "claude-code":
+        from .chat_cc import session_clear
+
+        session_clear(scope)
+    return n
 
 
 HELP = """**Assistant BankWatch** — je réponds à tout message de ce salon.
@@ -462,7 +588,7 @@ def chunks(text: str, size: int = 1990) -> list[str]:
 def run_discord() -> None:
     import discord
 
-    agent = Agent()
+    agent = make_agent()
     intents = discord.Intents.default()
     intents.message_content = True
     client = discord.Client(intents=intents)
@@ -499,7 +625,9 @@ def run_discord() -> None:
 
     @client.event
     async def on_ready() -> None:
-        log.info("connecté : %s — salons %s — autorisés %s — modèle %s", client.user, CHANNEL_IDS, ALLOWED_IDS, agent.model)
+        await start_backend()
+        log.info("connecté : %s — salons %s — autorisés %s — backend %s — modèle %s", client.user, CHANNEL_IDS,
+                 ALLOWED_IDS, settings.chat_backend, agent.model)
 
     @client.event
     async def on_message(msg: discord.Message) -> None:
@@ -517,7 +645,7 @@ def run_discord() -> None:
             await ch.send(HELP)
             return
         if low == "reset":
-            n = history_clear(str(ch.id))
+            n = forget_scope(str(ch.id))
             await ch.send(f"Historique oublié ({n} messages).")
             return
         if low == "usage":
@@ -538,7 +666,8 @@ def run_discord() -> None:
 
         async with ch.typing():
             try:
-                answer = await agent.run(str(ch.id), text, author, is_owner, authors_desc, confirm, progress)
+                answer = await agent.run(str(ch.id), text, author, is_owner, authors_desc, confirm, progress,
+                                         author_id=msg.author.id)
             except Exception as e:  # noqa: BLE001
                 log.exception("agent")
                 answer = f"⚠️ Erreur : {type(e).__name__}: {e}"
@@ -549,13 +678,14 @@ def run_discord() -> None:
 
 
 async def run_cli(question: str) -> None:
-    agent = Agent()
+    await start_backend()
+    agent = make_agent()
 
     async def confirm(title: str, detail: str) -> bool:
         print(f"[confirm refusé en mode test] {title} — {detail}")
         return False
 
-    answer = await agent.run("cli-test", question, "test", True, "test", confirm)
+    answer = await agent.run("cli-test", question, "test", True, "test", confirm, author_id=OWNER_ID or None)
     print(answer)
     i, o = usage_today()
     print(f"\n[{agent.model} — {i:,} in / {o:,} out aujourd'hui]")

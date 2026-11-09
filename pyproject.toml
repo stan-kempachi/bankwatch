@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
-chat = ["anthropic>=0.40", "discord.py>=2.3"]  # assistant Discord (bankwatch.chat)
+chat = ["anthropic>=0.40", "discord.py>=2.3", "mcp>=1.10,<2", "uvicorn>=0.30"]  # assistant Discord (bankwatch.chat, bankwatch.chat_cc)
 
 [project.scripts]
 bankwatch = "bankwatch.cli:app"

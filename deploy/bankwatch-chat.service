@@ -1,5 +1,5 @@
 [Unit]
-Description=BankWatch — assistant Discord (#budget, API Claude)
+Description=BankWatch — assistant Discord (#budget, Claude Code, deux instances)
 After=network-online.target bankwatch.service
 Wants=network-online.target
 
