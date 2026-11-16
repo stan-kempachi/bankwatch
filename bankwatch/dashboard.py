@@ -333,7 +333,8 @@ def summary():
     prev_same = spend_by_category(txs, ps, min(pe, ps + timedelta(days=today.day - 1)), EXCLUDE)
     prev_full = spend_by_category(txs, ps, pe, EXCLUDE)
     alerts = db.alerts(500)
-    open_alerts = [a for a in alerts if a["created_at"][:10] >= (today - timedelta(days=30)).isoformat()]
+    recent = [a for a in alerts if a["created_at"][:10] >= (today - timedelta(days=30)).isoformat()]
+    open_alerts = [a for a in recent if not a["resolved_at"]]  # actives : ni écartées, ni réglées
     accounts = [dict(a) for a in db.accounts(include_ignored=False)]
     from .forecast import load_config as _fc
 
@@ -356,6 +357,7 @@ def summary():
         "month_income": sum(t.amount for t in txs if t.amount > 0 and t.booking_date >= m_start and t.category not in EXCLUDE),
         "alerts_30d": len(open_alerts),
         "alerts_high_30d": sum(1 for a in open_alerts if a["severity"] == "high"),
+        "alerts_resolved_30d": len(recent) - len(open_alerts),
         "tx_count": len(txs),
     }
 
@@ -483,33 +485,65 @@ def watch():
 
 @app.get("/api/forecast")
 def forecast():
-    from .forecast import coverage_dicts, load_config
+    from .forecast import load_config, views_dicts
 
     cfg = load_config()
-    return {"horizon_days": cfg.horizon_days, "margin": cfg.margin, "accounts": coverage_dicts(_db(), date.today())}
+    views = views_dicts(_db(), date.today(), cfg)
+    default = next((v for v in views if v["default"]), views[0])
+    # "accounts" = vue par défaut (première vue à alertes) : compatibilité avec les anciens clients
+    return {"horizon_days": cfg.horizon_days, "margin": cfg.margin, "accounts": default["accounts"], "views": views}
 
 
 @app.get("/api/alerts")
-def alerts(limit: int = Query(100, le=500)):
-    return {"items": [dict(a) for a in _db().alerts(limit)]}
+def alerts(request: Request, limit: int = Query(100, le=500)):
+    """Alertes non écartées, actives et réglées (resolved_at renseigné). can_resolve : bouton « C'est bon »."""
+    return {"items": [dict(a) for a in _db().alerts(limit)],
+            "can_resolve": getattr(request.state, "role", None) == "admin"}
+
+
+@app.post("/api/alerts/{alert_id}/resolve")
+def alert_resolve(alert_id: int, request: Request):
+    """« C'est bon » (admin) : l'alerte n'est plus active, elle reste dans l'historique."""
+    if getattr(request.state, "role", None) != "admin":
+        return JSONResponse({"error": "réservé à l'administrateur"}, 403)
+    if not _db().resolve_alert(alert_id, by=getattr(request.state, "user", None) or "admin"):
+        return JSONResponse({"error": "alerte inconnue ou déjà réglée"}, 404)
+    return {"ok": True}
+
+
+@app.post("/api/alerts/{alert_id}/reopen")
+def alert_reopen(alert_id: int, request: Request):
+    """Annule un « C'est bon » (admin)."""
+    if getattr(request.state, "role", None) != "admin":
+        return JSONResponse({"error": "réservé à l'administrateur"}, 403)
+    if not _db().reopen_alert(alert_id):
+        return JSONResponse({"error": "alerte inconnue ou déjà active"}, 404)
+    return {"ok": True}
 
 
 @app.get("/api/alerts/stats")
 def alerts_stats(days: int = Query(30, ge=1, le=365)):
     db = _db()
     since = (date.today() - timedelta(days=days)).isoformat()
-    rows = db.conn.execute("SELECT kind, severity, dismissed, COUNT(*) n FROM alerts WHERE created_at >= ? GROUP BY 1,2,3", (since,)).fetchall()
+    rows = db.conn.execute("SELECT kind, severity, dismissed, resolved_at IS NOT NULL AS resolved, COUNT(*) n "
+                           "FROM alerts WHERE created_at >= ? GROUP BY 1,2,3,4", (since,)).fetchall()
     by_kind: dict[str, dict] = {}
     for r in rows:
-        k = by_kind.setdefault(r["kind"], {"kind": r["kind"], "total": 0, "dismissed": 0, "high": 0, "medium": 0, "low": 0})
+        k = by_kind.setdefault(r["kind"], {"kind": r["kind"], "total": 0, "dismissed": 0, "resolved": 0, "active": 0,
+                                           "high": 0, "medium": 0, "low": 0})
         k["total"] += r["n"]
-        k[r["severity"]] += r["n"] if not r["dismissed"] else 0
         if r["dismissed"]:
             k["dismissed"] += r["n"]
+        elif r["resolved"]:
+            k["resolved"] += r["n"]
+        else:  # active : c'est elle qui compte dans les gravités
+            k["active"] += r["n"]
+            k[r["severity"]] += r["n"]
     daily = db.conn.execute("SELECT substr(created_at,1,10) d, COUNT(*) n FROM alerts WHERE created_at >= ? AND dismissed=0 GROUP BY 1 ORDER BY 1", (since,)).fetchall()
     return {"days": days, "kinds": sorted(by_kind.values(), key=lambda k: -k["total"]),
             "daily": [{"date": r["d"], "n": r["n"]} for r in daily],
-            "total": sum(k["total"] for k in by_kind.values()), "dismissed": sum(k["dismissed"] for k in by_kind.values())}
+            "total": sum(k["total"] for k in by_kind.values()), "dismissed": sum(k["dismissed"] for k in by_kind.values()),
+            "resolved": sum(k["resolved"] for k in by_kind.values()), "active": sum(k["active"] for k in by_kind.values())}
 
 
 @app.get("/api/recommendations")

@@ -161,7 +161,8 @@ def eb_sync_account(db: Database, eb, acc, today: date | None = None, lookback_d
         lookback = lookback_days
     try:
         _count_access(db, acc_id, today)
-        txs = eb.transactions(acc_id, date_from=today - timedelta(days=lookback))
+        window_start = today - timedelta(days=lookback)
+        txs = eb.transactions(acc_id, date_from=window_start)
         cat = Categorizer()
         parsed = []
         for t in txs:
@@ -173,7 +174,10 @@ def eb_sync_account(db: Database, eb, acc, today: date | None = None, lookback_d
             if not tx.counterparty and tx.label:  # BoursoBank : pas de nom de marchand fourni
                 tx.counterparty = counterparty_from_label(tx.label)
             tx.category = cat.categorize(tx.counterparty, tx.label, tx.amount)
+        db.fold_drifting_pending(parsed)  # en attente sans référence dont la date a glissé : même opération
         new = db.upsert_transactions(parsed)
+        if parsed:  # photo des « en attente » : ce que la banque ne renvoie plus n'est plus en attente
+            db.purge_vanished_pending(acc_id, {t.id for t in parsed}, window_start, today)
         # solde : une fois par jour (ou si jamais lu), et seulement s'il reste du quota
         bal_today = db.get_meta(f"bal:{acc_id}") == today.isoformat()
         if (not bal_today or acc["balance"] is None or force_balance) and accesses_today(db, acc_id, today) < limit:
@@ -287,37 +291,188 @@ def wallet_banks() -> set[str]:
     return out
 
 
-def mark_wallet_pairs(db: Database, since: date | None = None, window_days: int = 3) -> int:
+WALLET_DEBIT_LAG_DAYS = 5    # un prélèvement SEPA arrive jusqu'à 5 jours après l'achat PayPal (week-end compris)
+WALLET_EARLY_DAYS = 3        # la ligne bancaire peut aussi précéder la ligne PayPal de quelques jours
+WALLET_CREDIT_LAG_DAYS = 14  # un remboursement reversé sur le compte bancaire met jusqu'à deux semaines
+WALLET_SPLITS = (3, 4)       # paiement en 3 ou 4 fois
+WALLET_SPLIT_SPAN_DAYS = 120  # durée maximale d'un échéancier
+
+
+def _is_wallet_loan(t: Tx) -> bool:
+    """Échéance d'un paiement en plusieurs fois (PayPal « 4X ») : code PAYMENT/LOAN chez Enable Banking,
+    créancier « …repayment@paypal.com »."""
+    eb = (t.raw or {}).get("_eb") or {}
+    if ((eb.get("bank_transaction_code") or {}).get("sub_code") or "").upper() == "LOAN":
+        return True
+    mail = ((eb.get("creditor") or {}).get("contact_details") or {}).get("email_address") or ""
+    return "repayment@" in mail.lower()
+
+
+@dataclass
+class WalletPlan:
+    """Achat payé en plusieurs fois depuis un portefeuille : l'achat, ses échéances déjà prélevées, ce qu'il reste."""
+    purchase: Tx
+    splits: int        # 3 ou 4
+    installment: float  # montant d'une échéance
+    category: str      # catégorie naturelle de l'achat
+    paid: list[Tx]     # échéances déjà prélevées (lignes LOAN)
+
+    @property
+    def remaining(self) -> float:
+        return round(abs(self.purchase.amount) - sum(abs(t.amount) for t in self.paid), 2)
+
+
+def wallet_plans(wallet_txs: list[Tx]) -> list[WalletPlan]:
+    """Reconstitue les échéanciers : un achat se reconnaît à sa première échéance, prélevée le même jour
+    (montant / 3 ou / 4) ; les échéances suivantes s'y rattachent, y compris plusieurs soldées d'un coup."""
+    loans = sorted((w for w in wallet_txs if w.amount < 0 and _is_wallet_loan(w)), key=lambda t: t.booking_date)
+    if not loans:
+        return []
+    cat = Categorizer()
+    taken: set[str] = set()
+    plans: list[WalletPlan] = []
+    for p in sorted(wallet_txs, key=lambda t: t.booking_date):
+        if p.amount >= 0 or _is_wallet_loan(p):
+            continue
+        for x in loans:
+            if x.id in taken or x.account_id != p.account_id or x.booking_date != p.booking_date:
+                continue
+            k = next((k for k in WALLET_SPLITS if abs(abs(p.amount) / k - abs(x.amount)) <= 0.02), None)
+            if k:
+                taken.add(x.id)
+                plans.append(WalletPlan(p, k, abs(x.amount), cat.categorize(p.counterparty, p.label, p.amount), [x]))
+                break
+    for x in loans:
+        if x.id in taken:
+            continue
+        for plan in plans:
+            days = (x.booking_date - plan.purchase.booking_date).days
+            n = round(abs(x.amount) / plan.installment)
+            if (x.account_id == plan.purchase.account_id and 0 <= days <= WALLET_SPLIT_SPAN_DAYS and n >= 1
+                    and abs(abs(x.amount) - n * plan.installment) <= 0.02 * n
+                    and abs(x.amount) <= plan.remaining + 0.05):
+                plan.paid.append(x)
+                taken.add(x.id)
+                break
+    return plans
+
+
+WALLET_LABELS = {"paypal": "PayPal"}
+WALLET_OVERDUE_DAYS = 7  # une échéance en retard de plus d'une semaine n'est plus attendue
+
+
+def wallet_installments_due(db: Database, today: date | None = None) -> list[dict]:
+    """Échéances restant à prélever des paiements en plusieurs fois, sur le compte bancaire qui paie l'échéancier
+    (celui où une échéance précédente est passée). Une échéance tombe tous les 30 jours à partir de l'achat.
+    Une échéance déjà notée côté portefeuille mais pas encore passée en banque reste attendue."""
+    today = today or date.today()
+    wallets = {a["id"]: a["bank"] for a in db.accounts(include_ignored=False) if a["bank"] in wallet_banks()}
+    if not wallets:
+        return []
+    hist = db.transactions(since=today - timedelta(days=WALLET_SPLIT_SPAN_DAYS + 30))
+    names = set(wallets.values())
+    bank_debits = [t for t in hist if t.account_id not in wallets and t.amount < 0
+                   and any(w in f"{t.counterparty} {t.label}".lower() for w in names)]
+    out: list[dict] = []
+    for plan in wallet_plans([t for t in hist if t.account_id in wallets]):
+        payer, not_yet = None, []
+        for x in sorted(plan.paid, key=lambda t: t.booking_date, reverse=True):
+            twin = next((b for b in bank_debits if abs(abs(b.amount) - abs(x.amount)) <= 0.005
+                         and -WALLET_EARLY_DAYS <= (b.booking_date - x.booking_date).days <= WALLET_DEBIT_LAG_DAYS), None)
+            if twin:
+                payer = payer or twin.account_id
+            elif (today - x.booking_date).days <= WALLET_DEBIT_LAG_DAYS:
+                not_yet.append(x)
+        if not payer:
+            continue  # échéancier payé depuis un compte que BankWatch ne suit pas
+        wallet = wallets[plan.purchase.account_id]
+        name = f"{WALLET_LABELS.get(wallet, wallet.capitalize())} {plan.splits}X · {plan.purchase.counterparty or plan.purchase.label}"
+        for x in not_yet:
+            out.append({"account_id": payer, "due": today, "amount": round(abs(x.amount), 2), "label": name})
+        left = min(plan.splits - 1, round(plan.remaining / plan.installment)) if plan.remaining > 0.05 else 0
+        for i in range(plan.splits - left, plan.splits):
+            due = plan.purchase.booking_date + timedelta(days=30 * i)
+            last = i == plan.splits - 1
+            amount = round(plan.remaining - plan.installment * (left - 1), 2) if last else plan.installment
+            if due < today:
+                if (today - due).days > WALLET_OVERDUE_DAYS:
+                    continue
+                due = today
+            out.append({"account_id": payer, "due": due, "amount": round(amount, 2),
+                        "label": f"{name} ({i + 1}/{plan.splits})"})
+    return out
+
+
+def mark_wallet_pairs(db: Database, since: date | None = None, window_days: int = WALLET_DEBIT_LAG_DAYS) -> int:
     """Un achat PayPal existe deux fois : côté PayPal (avec le marchand) et côté banque (« PRÉLÈVEMENT PayPal »
-    ou « CARTE PAYPAL *X »). La ligne bancaire de même montant à ≤ 3 jours devient un virement interne vers le
-    portefeuille ; la ligne PayPal garde la dépense et sa catégorie. Si PayPal remonte aussi l'alimentation
-    (crédit du même montant), elle est interne elle aussi. Sans jumeau côté PayPal, la ligne banque reste comptée."""
+    ou « CARTE PAYPAL *X »). La ligne bancaire de même montant, de 3 jours avant à `window_days` jours après,
+    devient un virement interne vers le portefeuille ; la ligne PayPal garde la dépense et sa catégorie. Si PayPal
+    remonte aussi l'alimentation (crédit du même montant), elle est interne elle aussi. Sans jumeau côté PayPal,
+    la ligne banque reste comptée.
+
+    Remboursement reversé à la banque (« VIR PayPal » en crédit) : le crédit PayPal de même montant, jusqu'à
+    14 jours plus tôt, garde le remboursement ; la ligne bancaire devient interne.
+
+    Paiement en plusieurs fois (4X) : PayPal remonte l'achat entier ET chaque échéance (code LOAN). Ce sont les
+    échéances qui sortent de la banque : l'achat devient interne (financé par PayPal) et chaque échéance porte la
+    dépense, avec la catégorie de l'achat. L'achat se reconnaît à sa première échéance, prélevée le même jour
+    (montant / 3 ou / 4)."""
     wallets = {a["id"]: a["bank"] for a in db.accounts(include_ignored=False) if a["bank"] in wallet_banks()}
     if not wallets:
         return 0
     since = since or (date.today() - timedelta(days=45))
-    txs = db.transactions(since=since)
-    wallet_txs = [t for t in txs if t.account_id in wallets]
+    hist = db.transactions(since=since - timedelta(days=WALLET_SPLIT_SPAN_DAYS))
+    txs = [t for t in hist if t.booking_date >= since]
+    wallet_txs = [t for t in hist if t.account_id in wallets]
     names = set(wallets.values())
-    bank_txs = [t for t in txs if t.account_id not in wallets and t.amount < 0
-                and any(w in f"{t.counterparty} {t.label}".lower() for w in names)]
-    used: set[str] = set()
     n = 0
-    for b in sorted(bank_txs, key=lambda t: t.booking_date):
-        cands = [w for w in wallet_txs if w.id not in used and abs(abs(w.amount) - abs(b.amount)) <= 0.005
-                 and abs((w.booking_date - b.booking_date).days) <= window_days]
+
+    def set_cat(t: Tx, category: str) -> None:
+        nonlocal n
+        if t.category != category:
+            db.set_category(t.id, category)
+            t.category = category
+            n += 1
+
+    # 1) paiements en plusieurs fois
+    plans = wallet_plans(wallet_txs)
+    for plan in plans:
+        set_cat(plan.purchase, "epargne_virement")
+        if plan.category != "epargne_virement":
+            for x in plan.paid:
+                set_cat(x, plan.category)
+    financed_ids = {plan.purchase.id for plan in plans}
+
+    # 2) débits bancaires vers le portefeuille
+    def mentions(t: Tx) -> bool:
+        return any(w in f"{t.counterparty} {t.label}".lower() for w in names)
+
+    bank_debits = [t for t in txs if t.account_id not in wallets and t.amount < 0 and mentions(t)]
+    used: set[str] = set()
+    for b in sorted(bank_debits, key=lambda t: t.booking_date):
+        cands = [w for w in wallet_txs if w.id not in used and w.id not in financed_ids
+                 and abs(abs(w.amount) - abs(b.amount)) <= 0.005
+                 and -WALLET_EARLY_DAYS <= (b.booking_date - w.booking_date).days <= window_days]
         if not cands:
             continue
         # alimentation (crédit) d'abord, sinon l'achat lui-même ; au plus proche en date
         cands.sort(key=lambda w: (w.amount < 0, abs((w.booking_date - b.booking_date).days)))
         w = cands[0]
         used.add(w.id)
-        if b.category != "epargne_virement":
-            db.set_category(b.id, "epargne_virement")
-            n += 1
-        if w.amount > 0 and w.category != "epargne_virement":
-            db.set_category(w.id, "epargne_virement")
-            n += 1
+        set_cat(b, "epargne_virement")
+        if w.amount > 0:
+            set_cat(w, "epargne_virement")
+
+    # 3) remboursements et argent reçu reversés sur le compte bancaire
+    bank_credits = [t for t in txs if t.account_id not in wallets and t.amount > 0 and mentions(t)]
+    for b in sorted(bank_credits, key=lambda t: t.booking_date):
+        cands = [w for w in wallet_txs if w.id not in used and w.amount > 0 and abs(w.amount - b.amount) <= 0.005
+                 and -1 <= (b.booking_date - w.booking_date).days <= WALLET_CREDIT_LAG_DAYS]
+        if not cands:
+            continue
+        cands.sort(key=lambda w: abs((w.booking_date - b.booking_date).days))
+        used.add(cands[0].id)
+        set_cat(b, "epargne_virement")
     db.commit()
     return n
 

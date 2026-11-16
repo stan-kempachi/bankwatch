@@ -14,12 +14,28 @@ from .rules import Alert, run_all
 CANDIDATE_WINDOW_DAYS = 10  # on ne juge que les transactions récentes, pas tout l'historique importé
 
 
+# Alertes « d'état » : elles décrivent une situation qui dure (il manque de l'argent, compte à découvert,
+# virement conseillé), pas un événement. Quand la situation disparaît, l'alerte se clôt toute seule ;
+# si elle revient, elle se rouvre.
+STATE_KINDS = frozenset({"forecast_short", "forecast_card", "overdraft_start", "overdraft_ongoing", "recommendation"})
+
+
+# Bonnes nouvelles : notifiées sur Discord, mais rien à valider — enregistrées directement comme réglées.
+SETTLED_KINDS = frozenset({"forecast_ok"})
+
+
 def store_alerts(db: Database, alerts: list[Alert]) -> list[Alert]:
     new: list[Alert] = []
     for a in alerts:
-        if db.add_alert(a.fingerprint, a.kind, a.severity, a.title, a.message, a.amount, a.tx_ids):
+        if db.add_alert(a.fingerprint, a.kind, a.severity, a.title, a.message, a.amount, a.tx_ids,
+                        reopen=a.kind in STATE_KINDS, settled=a.kind in SETTLED_KINDS):
             new.append(a)
     return new
+
+
+def close_settled(db: Database, alerts: list[Alert]) -> int:
+    """Clôt les alertes d'état que les détecteurs n'émettent plus (virement fait, découvert comblé…)."""
+    return db.clear_stale(STATE_KINDS, {a.fingerprint for a in alerts})
 
 
 def run_checks(db: Database, new_txs: list[Tx] | None = None, today: date | None = None,
@@ -49,6 +65,7 @@ def run_checks(db: Database, new_txs: list[Tx] | None = None, today: date | None
     alerts += detect_overdraft(db, today)
     alerts += detect_recommendations(db, today)
     new_alerts = store_alerts(db, alerts)
+    close_settled(db, alerts)
 
     baseline = db.get_meta("baseline_done") is None
     if baseline:

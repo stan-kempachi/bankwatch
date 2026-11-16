@@ -26,14 +26,14 @@ import shlex
 import sqlite3
 import sys
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import anthropic
-
-from dataclasses import dataclass
 
 from .config import settings
 
@@ -115,7 +115,7 @@ class Instance:
         return self.root == ROOT
 
 
-def load_instances() -> dict[str, "Instance"]:
+def load_instances() -> dict[str, Instance]:
     """data/chat_instances.json : {"stan": {"root": "/…/bankwatch", "label": "…", "users": ["<id>"]}, …}.
     Sans fichier : une seule instance, celle du dépôt courant."""
     path = Path(settings.chat_instances_file)
@@ -140,7 +140,7 @@ INSTANCES = load_instances()
 MULTI = len(INSTANCES) > 1
 
 
-def instance_for(author_id: int | None, requested: str | None) -> "Instance":
+def instance_for(author_id: int | None, requested: str | None) -> Instance:
     if requested:
         if requested not in INSTANCES:
             raise Refused(f"instance inconnue : {requested} (connues : {', '.join(INSTANCES)})")
@@ -220,7 +220,7 @@ def usage_add(inp: int, out: int) -> None:
 # Commandes bankwatch autorisées. "free" = exécution directe ; "confirm" = bouton ✅ (quota DSP2 ou écriture).
 FREE_CMDS = {"accounts", "alerts", "forecast", "watch", "institutions"}
 FREE_SUBCMDS = {("user", "list"), ("token", "list")}
-CONFIRM_CMDS = {"sync", "run", "check", "dismiss", "dedupe", "recategorize", "ignore", "report",
+CONFIRM_CMDS = {"sync", "run", "check", "dismiss", "resolve", "reopen", "dedupe", "recategorize", "ignore", "report",
                 "notify-test", "webhook-test", "link"}
 RULE_FILES = {"categories.json", "forecast.json", "overdraft.json", "watch.json"}
 SQL_FORBIDDEN = re.compile(r"\b(attach|detach|pragma|insert|update|delete|drop|alter|create|replace|vacuum|reindex)\b", re.I)
@@ -256,7 +256,7 @@ async def run_bankwatch(args: list[str], inst: Instance, timeout: int = 240) -> 
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         return f"⏱️ `bankwatch {' '.join(args)}` interrompu après {timeout}s."
     text = out.decode("utf-8", "replace").strip()
@@ -370,8 +370,8 @@ def t_etat(inst: Instance) -> str:
                 f"- {a['bank']} {a['name'] or ''} ({(a['iban'] or '')[-4:]}) : solde lu {eb['balance']} € "
                 f"({(eb['read_at'] or '')[:16]}), estimé {est} € ({eb['since_count']} op. depuis), "
                 f"accès DSP2 aujourd'hui {used}/{settings.eb_daily_access_limit}")
-        alerts = db.alerts(limit=10)
-        lines.append("Alertes récentes (non écartées) :" if alerts else "Aucune alerte récente.")
+        alerts = db.alerts(limit=10, active_only=True)
+        lines.append("Alertes actives (ni réglées, ni écartées) :" if alerts else "Aucune alerte active.")
         for al in alerts:
             lines.append(f"  · #{al['id']} [{al['severity']}] {al['title']} — {al['created_at'][:16]}")
         row = db.conn.execute("SELECT MAX(last_sync) FROM accounts WHERE ignored = 0").fetchone()
@@ -385,9 +385,9 @@ def t_etat(inst: Instance) -> str:
 TOOLS: list[dict[str, Any]] = [
     {"name": "etat", "description": "Photo rapide de BankWatch : solde lu et estimé par compte, quota DSP2 consommé aujourd'hui, alertes récentes, dernier passage. À appeler en premier pour « où j'en suis ? ».",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "bankwatch_cmd", "description": "Exécute une commande du CLI bankwatch. Sans validation : accounts, alerts [--all], forecast, watch, institutions <nom>, report --dry-run, user list, token list. Avec bouton ✅ de l'utilisateur : sync (consomme du quota DSP2 : 1 accès transactions par compte, +1 si relecture de solde), run (sync+contrôles+alertes), check [--no-notify], dismiss <n°>, dedupe, recategorize, ignore <id>, report --days N, notify-test, webhook-test, link <nom-court> \"<ASPSP>\" [--business] (génère un lien de consentement bancaire à transmettre à l'utilisateur ; ne consomme pas de quota). Tout le reste est refusé.",
+    {"name": "bankwatch_cmd", "description": "Exécute une commande du CLI bankwatch. Sans validation : accounts, alerts [--all] [--active], forecast, watch, institutions <nom>, report --dry-run, user list, token list. Avec bouton ✅ de l'utilisateur : sync (consomme du quota DSP2 : 1 accès transactions par compte, +1 si relecture de solde), run (sync+contrôles+alertes), check [--no-notify], resolve <n°> (« c'est bon » : alerte réglée, plus active), reopen <n°>, dismiss <n°> (fausse alerte), dedupe, recategorize, ignore <id>, report --days N, notify-test, webhook-test, link <nom-court> \"<ASPSP>\" [--business] (génère un lien de consentement bancaire à transmettre à l'utilisateur ; ne consomme pas de quota). Tout le reste est refusé.",
      "input_schema": {"type": "object", "properties": {"args": {"type": "string", "description": "arguments après `bankwatch`, ex. `alerts --all` ou `dismiss 12`"}}, "required": ["args"]}},
-    {"name": "bankwatch_sql", "description": "Requête SELECT en lecture seule sur la base BankWatch (SQLite). Tables : accounts(id,bank,name,iban,balance,balance_date,last_sync,ignored), transactions(id,account_id,booking_date,value_date,amount,counterparty,label,category,status[booked|pending],first_seen ; NE PAS sélectionner la colonne raw), alerts(id,kind,severity,title,message,amount,tx_ids,created_at,sent_at,dismissed), meta(key,value). Montants : débit négatif. Dates ISO. 200 lignes max.",
+    {"name": "bankwatch_sql", "description": "Requête SELECT en lecture seule sur la base BankWatch (SQLite). Tables : accounts(id,bank,name,iban,balance,balance_date,last_sync,ignored), transactions(id,account_id,booking_date,value_date,amount,counterparty,label,category,status[booked|pending],first_seen ; NE PAS sélectionner la colonne raw), alerts(id,kind,severity,title,message,amount,tx_ids,created_at,sent_at,dismissed,resolved_at,resolved_by[auto|nom] ; active = dismissed=0 AND resolved_at IS NULL), meta(key,value). Montants : débit négatif. Dates ISO. 200 lignes max.",
      "input_schema": {"type": "object", "properties": {"sql": {"type": "string"}}, "required": ["sql"]}},
     {"name": "budget_sql", "description": "Requête SELECT en lecture seule sur la base de l'appli Budget du foyer (SQLite). Tables : docs(path,data JSON) avec path 'budget/config' (postes : id, nom, type pro|revenu|fixe|variable…, montant, compte), 'budget/jours', 'mois/AAAA-MM' (prev/reel par poste) ; transactions(id,account_uid,booking_date,amount,label,counterparty,status[a_classer|classe|…],poste_id,rule_id,category,internal) ; rules(id,pattern,sens,account_uid,action,poste_id,priority) ; bank_accounts(uid,bank,name,iban,role,last_sync,active). Utilise json_extract() sur docs.data.",
      "input_schema": {"type": "object", "properties": {"sql": {"type": "string"}}, "required": ["sql"]}},
@@ -566,7 +566,7 @@ def forget_scope(scope: str) -> int:
 
 
 HELP = """**Assistant BankWatch** — je réponds à tout message de ce salon.
-Exemples : « où j'en suis ? », « combien de courses ce mois ? », « quelles alertes cette semaine ? », « lance une synchro » (✅ à valider), « écarte l'alerte 12 », « ajoute le mot-clé X à la catégorie restos », « qu'est-ce qui est prévu au budget en décembre ? », « retiens que … ».
+Exemples : « où j'en suis ? », « combien de courses ce mois ? », « quelles alertes cette semaine ? », « lance une synchro » (✅ à valider), « l'alerte 12 c'est bon », « écarte l'alerte 12 » (fausse alerte), « ajoute le mot-clé X à la catégorie restos », « qu'est-ce qui est prévu au budget en décembre ? », « retiens que … ».
 Mots-clés : `aide` · `reset` (oublie l'historique du salon) · `usage` (tokens du jour)."""
 
 

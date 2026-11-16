@@ -13,7 +13,7 @@ Enable Banking / relevés CSV ──► sync ──► SQLite ──► règles 
 
 | Règle | Déclencheur | Gravité |
 |---|---|---|
-| **Doublon** | même marchand, même montant, ≤ 3 j d'écart | 🚨 même compte / ⚠️ deux comptes |
+| **Doublon** | même marchand, même montant, ≤ 3 j d'écart — hors virements entre ses propres comptes et retraits d'espèces (`BW_DUP_SKIP_CATEGORIES`) | 🚨 même compte / ⚠️ deux comptes |
 | **Prélèvement modifié** | un récurrent varie de plus de 10 % par rapport à sa médiane | ⚠️ hausse / ℹ️ baisse |
 | **Prélèvement passé deux fois** | un récurrent passe deux fois dans le mois, ou plus tôt que sa cadence habituelle | ⚠️ |
 | **Montant inhabituel** | marchand connu, z-score ≥ 3 et ≥ 2× la moyenne | ⚠️ |
@@ -125,8 +125,17 @@ BankWatch ne peut **pas** faire de virement : l'accès open banking est en lectu
 
 - Les **récurrents détectés** (loyer, abonnements…) sont projetés à leur prochaine échéance (même jour du mois).
 - Les **cartes à débit différé** (`card_settlements`) : le montant attendu = solde dû sur la carte, prélevé sur `debit_bank` autour de `due_day`.
-- Pour chaque compte, sur `horizon_days` : total à venir + `margin` comparé au solde.
-  - **Manque** → alerte Discord immédiate avec le montant à virer (une fois par échéance).
+- Pour chaque compte, sur chaque **vue** (horizon) : total à venir + `margin` comparé au solde. Les vues se déclarent dans `views` ; sans `views`, une seule vue de `horizon_days` jours (comportement historique) :
+  ```json
+  "views": [
+    {"name": "14j",    "type": "rolling",    "days": 14, "alerts": true},
+    {"name": "mois",   "type": "month_end",              "alerts": true},
+    {"name": "30j",    "type": "rolling",    "days": 30, "alerts": false},
+    {"name": "mois+1", "type": "next_month",             "alerts": false}
+  ]
+  ```
+  `rolling` = aujourd'hui + `days` jours ; `month_end` = d'aujourd'hui au dernier jour du mois civil inclus ; `next_month` = du 1er au dernier jour du mois suivant (le solde comparé reste le solde actuel). Seules les vues `alerts: true` créent des alertes et alimentent les recommandations de virements ; les autres sont affichées seulement (`bankwatch forecast`, une section par vue ; dashboard, un onglet par vue). Un compte en manque sur plusieurs vues ne donne qu'**une** alerte, celle de la vue la plus exigeante (nommée dans le titre).
+  - **Manque** → alerte Discord immédiate avec le montant à virer et la date du premier prélèvement que le solde ne couvre plus (une fois par compte et par échéance ; tant que le manque dure, l'alerte suit les chiffres du jour sans être renvoyée).
   - Retour à la normale après un virement → « couvert ✓ ».
   - Règlement de carte : point d'étape à J-`notice_days` quoi qu'il arrive (OK ou manque).
 - Dashboard : carte « Prélèvements à venir » ; CLI : `bankwatch forecast` ; rapport hebdo : section « 📅 ».
@@ -138,6 +147,23 @@ L'historique des soldes est reconstitué depuis les opérations (solde à J = so
 ## Recommandations de virements
 
 Quand un compte a un besoin (découvert + marge, ou prélèvements à venir non couverts) et qu'un autre a du disponible (solde − ses propres échéances − marge − règlement de carte à prévoir), BankWatch propose le virement : montant arrondi à 5 €, comptes personnels avant les comptes pro (`accounts.<bank>.pro` dans `rules/forecast.json`), note comptable pour un compte pro. Alerte Discord « 💡 Virer X € de A vers B » une fois par semaine et par besoin, carte « Recommandations » en tête du dashboard. BankWatch ne fait **jamais** le virement lui-même.
+
+## Opérations en attente
+
+Les opérations « en attente » sont traitées comme une photo de ce que la banque annonce, pas comme un historique :
+
+- **Sans référence** (certaines banques ne donnent ni identifiant ni date d'opération tant que ce n'est pas comptabilisé, et renvoient la date du jour) : une ligne relue le lendemain avec une autre date est rattachée à celle déjà enregistrée (même compte, même montant, même libellé). Sans cela, le même retrait serait compté une fois par jour. Si la banque renvoie les deux lignes en même temps, ce sont bien deux opérations.
+- **Disparues** : une opération en attente que la banque ne renvoie plus (comptabilisée sous une autre ligne, annulée, autorisation expirée) est retirée, et les alertes qui la citaient sont réglées.
+
+## Cycle de vie d'une alerte
+
+Une alerte est **active** tant qu'elle n'est ni réglée ni écartée.
+
+- **Réglée d'elle-même** : les alertes qui décrivent une situation (prélèvements non couverts, découvert, virement conseillé, point carte) se clôturent toutes seules dès que la situation disparaît — par exemple après le virement qui comble le manque. Si la situation revient, la même alerte est rouverte avec les chiffres du jour et renotifiée. Les bonnes nouvelles (« prélèvements couverts ✓ ») sont envoyées sur Discord mais enregistrées directement comme réglées : rien à valider.
+- **« C'est bon »** : bouton sur chaque alerte du dashboard (admin), ou `bankwatch resolve <n°>` (dans Discord : « l'alerte 12 c'est bon », avec ✅). L'alerte quitte les actives et reste dans l'historique, repliée sous « Réglées » ; `Rouvrir` / `bankwatch reopen <n°>` annule.
+- **Écartée** (`bankwatch dismiss <n°>`) : fausse alerte, elle disparaît et ne renaît jamais.
+
+Les compteurs du dashboard (« Alertes 30 j », critiques, récapitulatif par type) ne comptent que les alertes actives.
 
 ## Brancher d'autres applications
 

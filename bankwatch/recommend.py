@@ -87,7 +87,9 @@ def analyse(db: Database, today: date | None = None) -> tuple[list[Need], list[S
 
     raw = json.loads(FORECAST_FILE.read_text(encoding="utf-8")) if FORECAST_FILE.exists() else {}
     rnd = float(raw.get("transfer_round", 5))
-    covs: dict[str, Coverage] = {c.account_id: c for c in coverage(db, today, cfg)}
+    # seules les vues alerts:true comptent ; par compte, on retient la vue la plus exigeante
+    views_covs = [{c.account_id: c for c in coverage(db, today, cfg, v)} for v in cfg.alert_views()]
+    covs: dict[str, Coverage] = views_covs[0] if views_covs else {}
     ods = {o.account_id: o for o in current_overdrafts(db, today)}
 
     needs: list[Need] = []
@@ -95,20 +97,22 @@ def analyse(db: Database, today: date | None = None) -> tuple[list[Need], list[S
     for acc_id, c in covs.items():
         if _acc_cfg(raw, c.bank).get("wallet") or c.bank in wallet_banks():
             continue  # portefeuille (PayPal) : ni besoin, ni source
+        mine = [vc[acc_id] for vc in views_covs if acc_id in vc]
+        worst = max(mine, key=lambda x: x.shortfall)
         reasons = []
         need = 0.0
         if acc_id in ods:
             od = ods[acc_id]
             need = max(need, od.amount + c.margin)
             reasons.append(f"découvert de {eur(od.amount)} depuis le {od.since:%d/%m} ({od.days} j)")
-        if c.shortfall > 0:
-            need = max(need, c.shortfall)
-            nxt = min(i.due for i in c.items)
-            reasons.append(f"{eur(c.total)} de prélèvements avant le {nxt:%d/%m} non couverts")
+        if worst.shortfall > 0:
+            need = max(need, worst.shortfall)
+            first = worst.first_uncovered or min(worst.items, key=lambda i: i.due)
+            reasons.append(f"{eur(worst.total)} de prélèvements à venir, non couverts à partir du {first.due:%d/%m}")
         if need > 0:
             needs.append(Need(acc_id, c.bank, c.name, math.ceil(need / rnd) * rnd, reasons))
         else:
-            reserved = c.total + c.margin + sum(i.amount for i in c.later)
+            reserved = max(m.total + m.margin + sum(i.amount for i in m.later) for m in mine)
             sources.append(Source(acc_id, c.bank, c.name, c.balance, round(reserved, 2), bool(_acc_cfg(raw, c.bank).get("pro"))))
 
     sources.sort(key=lambda s: (s.pro, -s.available))  # perso d'abord, puis le plus garni

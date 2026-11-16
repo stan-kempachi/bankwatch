@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # Seuils de détection
     dup_window_days: int = 3  # fenêtre de recherche de doublons
     dup_min_amount: float = 5.0  # en dessous, on ignore (cafés, etc.)
+    # catégories jamais signalées en doublon : deux virements entre ses propres comptes ou deux retraits
+    # du même montant sont des gestes volontaires, pas un marchand qui débite deux fois
+    dup_skip_categories: str = "epargne_virement,retrait"
     unusual_zscore: float = 3.0  # z-score pour « montant inhabituel » chez un marchand connu (et ≥ 2× la moyenne)
     unusual_min_history: int = 4  # nb de transactions mini pour calculer un z-score
     new_merchant_amount: float = 150.0  # nouveau marchand + montant >= seuil -> alerte
@@ -95,6 +98,18 @@ class Settings(BaseSettings):
     chat_cc_max_turns: int = 12
     chat_cc_timeout: int = 600        # s — inclut l'attente d'une validation ✅ (5 min)
     chat_mcp_port: int = 8121         # serveur MCP HTTP local hébergé par le bot
+    # délégation de code (outils agent_code / agent_deployer, voir bankwatch/agent.py)
+    chat_agent_depots_file: Path = Path("data/agent_depots.json")  # liste blanche des dépôts (hors git)
+    chat_agent_mcp_port: int = 8122   # second serveur MCP local : git/pytest/ruff de la session d'agent
+    chat_agent_model: str = "sonnet"  # modèle de la session `claude -p` qui modifie le code
+    chat_agent_max_turns: int = 80
+    chat_agent_timeout: int = 600     # s — durée maximale d'une session d'agent
+    chat_agent_max_prompt: int = 1500 # caractères : le prompt est affiché en entier dans la demande ✅
+    chat_agent_work_dir: str = "~/agent-work"       # clones de travail (un par dépôt, recréé à chaque session)
+    chat_agent_runs_dir: Path = Path("data/agent-runs")  # config Claude isolée + transcriptions par session
+    chat_agent_git_name: str = "agent-code"
+    chat_agent_git_email: str = "agent-code@localhost"
+    chat_agent_user_ids: str = ""     # ids Discord autorisés, en plus du propriétaire, à utiliser agent_code / agent_deployer
 
 
 settings = Settings()

@@ -64,6 +64,13 @@ td.num, th.num { text-align:right; font-variant-numeric: tabular-nums; white-spa
 .alert .t { font-weight:600; font-size:13px; }
 .alert .m { color:var(--ink-2); font-size:12.5px; white-space:pre-line; }
 .alert .meta { color:var(--muted); font-size:11px; margin-top:2px; }
+.alert .acts { margin-top:6px; }
+.alert.done .ico { background:var(--axis); color:var(--good-text); }
+.alert.done .t, .alert.done .m { color:var(--muted); }
+.alert.done .m { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.btn.ok { color:var(--good-text); font-weight:600; padding:6px 12px; }
+details.al-done { border-top:1px solid var(--grid); margin-top:4px; padding-top:8px; }
+details.al-done summary { cursor:pointer; color:var(--ink-2); font-size:12.5px; padding:4px 0; }
 .scroll { max-height:420px; overflow:auto; }
 .filters { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
 .filters input, .filters select { font:inherit; font-size:13px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--page); color:var(--ink); }
@@ -190,6 +197,7 @@ details.od-d ul { margin:6px 0 0; padding-left:18px; font-size:12.5px; color:var
 
   <section class="card span-6" id="forecast-card" hidden>
     <h2>Prélèvements à venir</h2>
+    <div class="tabs" id="forecast-tabs" role="group" aria-label="Horizon" style="display:none;flex-wrap:wrap;margin:0 0 6px"></div>
     <p class="hint" id="forecast-hint"></p>
     <div id="forecast" style="display:grid;gap:12px;grid-template-columns:1fr"></div>
   </section>
@@ -473,7 +481,7 @@ function redrawCharts() { drawMonthly(); drawCumul(); drawWatch(); }
 const KIND_LABELS = { duplicate: 'Doublons', recurring_amount: 'Prélèvement modifié', recurring_double: 'Prélèvement doublé', unusual_amount: 'Montant inhabituel',
   new_merchant: 'Nouveau marchand', big_amount: 'Gros débit', overspend_total: 'Surdépense globale', overspend_category: 'Surconso catégorie', budget_exceeded: 'Budget dépassé',
   budget_warning: 'Budget 80 %', watch_extra: 'Recharge (marchand suivi)', watch_cap: 'Plafond (marchand suivi)', watch_cap80: 'Plafond 80 %', watch_subscription: 'Abonnement modifié',
-  forecast_short: 'Prélèvement non couvert', forecast_ok: 'Prélèvement couvert', forecast_card: 'Point carte J-3', overdraft_start: 'Découvert', overdraft_ongoing: 'Découvert qui dure' };
+  recommendation: 'Virement conseillé', forecast_short: 'Prélèvement non couvert', forecast_ok: 'Prélèvement couvert', forecast_card: 'Point carte J-3', overdraft_start: 'Découvert', overdraft_ongoing: 'Découvert qui dure' };
 
 async function loadRecos() {
   const d = await api('/api/recommendations');
@@ -536,9 +544,10 @@ async function loadOverdraft() {
           y: { grid: { color: ctx2 => ctx2.tick.value === 0 ? css('--ink-2') : css('--grid'), lineWidth: ctx2 => ctx2.tick.value === 0 ? 1.5 : 1 }, border: { display: false },
             ticks: { color: css('--muted'), font: { size: 10 }, maxTicksLimit: 4, callback: v => fmt.format(v) }, suggestedMax: 50 } } } });
   });
-  document.getElementById('as-hint').textContent = `${st.total} alerte${st.total > 1 ? 's' : ''} émise${st.total > 1 ? 's' : ''}, dont ${st.dismissed} écartée${st.dismissed > 1 ? 's' : ''} comme fausse${st.dismissed > 1 ? 's' : ''}`;
+  const pl = n => n > 1 ? 's' : '';
+  document.getElementById('as-hint').textContent = `${st.total} alerte${pl(st.total)} émise${pl(st.total)} : ${st.active} active${pl(st.active)}, ${st.resolved} réglée${pl(st.resolved)}, ${st.dismissed} écartée${pl(st.dismissed)} comme fausse${pl(st.dismissed)}`;
   document.getElementById('alert-stats').innerHTML = st.kinds.length ? st.kinds.map(k => `<div class="as-row"><span>${esc(KIND_LABELS[k.kind] || k.kind)}</span>
-    <span class="n">${k.high ? `<span class="delta-up">${k.high} critique${k.high > 1 ? 's' : ''}</span> · ` : ''}${k.total - k.dismissed} active${k.total - k.dismissed > 1 ? 's' : ''}${k.dismissed ? ` · ${k.dismissed} écartée${k.dismissed > 1 ? 's' : ''}` : ''}</span></div>`).join('') : '<div class="empty">Aucune alerte sur la période.</div>';
+    <span class="n">${k.high ? `<span class="delta-up">${k.high} critique${k.high > 1 ? 's' : ''}</span> · ` : ''}${k.active ? `${k.active} active${pl(k.active)}` : '<span style="color:var(--good-text)">✓ aucune active</span>'}${k.resolved ? ` · ${k.resolved} réglée${pl(k.resolved)}` : ''}${k.dismissed ? ` · ${k.dismissed} écartée${pl(k.dismissed)}` : ''}</span></div>`).join('') : '<div class="empty">Aucune alerte sur la période.</div>';
 }
 
 let isAdmin = false;
@@ -572,18 +581,34 @@ async function loadSync() {
   };
 }
 
+let forecastData = null, forecastView = null;
 async function loadForecast() {
-  const d = await api('/api/forecast');
-  const withItems = d.accounts.filter(a => a.items.length || a.later.length);
-  const card = document.getElementById('forecast-card');
-  card.hidden = false;
-  document.getElementById('forecast-hint').textContent = `${d.horizon_days} prochains jours · marge de sécurité ${fmt.format(d.margin)} par compte` + (withItems.length ? '' : ' · rien de prévu');
+  forecastData = await api('/api/forecast');
+  renderForecast();
+}
+
+function renderForecast() {
+  const d = forecastData;
+  // une ou plusieurs vues (rules/forecast.json « views ») ; ancienne API sans « views » : une seule vue
+  const views = d.views && d.views.length ? d.views : [{ name: `${d.horizon_days} j`, alerts: true, default: true, accounts: d.accounts }];
+  const v = views.find(x => x.name === forecastView) || views.find(x => x.default) || views[0];
+  const tabs = document.getElementById('forecast-tabs');
+  tabs.style.display = views.length > 1 ? 'flex' : 'none';
+  tabs.innerHTML = views.map(x => `<button data-fview="${esc(x.name)}" aria-pressed="${x.name === v.name}">${esc(x.name)}</button>`).join('');
+  tabs.querySelectorAll('[data-fview]').forEach(btn => btn.onclick = () => { forecastView = btn.dataset.fview; renderForecast(); });
+  const withItems = v.accounts.filter(a => a.items.length || a.later.length);
+  document.getElementById('forecast-card').hidden = false;
+  const win = v.start ? `du ${fdate(v.start)} au ${fdate(v.end)}` : `${d.horizon_days} prochains jours`;
+  document.getElementById('forecast-hint').textContent = `${win} · marge de sécurité ${fmt.format(d.margin)} par compte`
+    + (v.alerts ? '' : ' · affichage seul, sans alerte') + (withItems.length ? '' : ' · rien de prévu');
   document.getElementById('forecast').innerHTML = withItems.map(a => `
     <div class="fc ${a.ok ? 'ok' : 'short'}">
-      <div class="h"><b>${esc(bankName(a.bank))}</b><span class="st">${a.ok ? '✓ couvert' : 'il manque ' + fmt2.format(a.shortfall)}</span></div>
+      <div class="h"><b>${esc(bankName(a.bank))}</b><span class="st">${a.ok ? '✓ couvert' : (v.alerts ? 'il manque ' : 'il manquerait ') + fmt2.format(a.shortfall)}</span></div>
       <div class="bal">solde ${fmt2.format(a.balance)} · à venir ${fmt2.format(a.total)}</div>
       <ul>${a.items.map(i => `<li><span>${fdate(i.due)} · ${esc(i.label)}${i.estimate ? ' <span class="pill">estimé</span>' : ''}</span><span class="num">${fmt2.format(i.amount)}</span></li>`).join('')}</ul>
-      ${a.ok ? '' : `<div class="todo">→ virer au moins ${fmt2.format(a.shortfall)} sur ${esc(bankName(a.bank))}</div>`}
+      ${a.ok ? '' : v.alerts
+        ? `<div class="todo">→ virer au moins ${fmt2.format(a.shortfall)} sur ${esc(bankName(a.bank))}${a.uncovered_from ? ' avant le ' + fdate(a.uncovered_from) : ''}</div>`
+        : `<div class="todo">au solde actuel, sans compter les rentrées à venir${a.uncovered_from ? ' · premier prélèvement non couvert le ' + fdate(a.uncovered_from) : ''}</div>`}
       ${a.later.length ? `<div class="later"><div class="l">À prévoir ensuite</div><ul>${a.later.map(i => `<li><span>${fdate(i.due)} · ${esc(i.label)} <span class="pill">estimé</span></span><span class="num">${fmt2.format(i.amount)}</span></li>`).join('')}</ul>
         <div class="${a.projected_shortfall ? 'warn' : 'fine'}">${a.projected_shortfall ? '⚠ au solde actuel, il manquera ' + fmt2.format(a.projected_shortfall) : '✓ couvert au solde actuel'}</div></div>` : ''}
     </div>`).join('') || '<div class="empty">Aucun prélèvement connu dans la fenêtre.</div>';
@@ -632,30 +657,59 @@ async function loadSummary() {
   document.getElementById('k-income').textContent = fmt.format(s.month_income);
   document.getElementById('k-income-sub').textContent = 'Hors virements internes';
   document.getElementById('k-alerts').textContent = s.alerts_30d;
-  document.getElementById('k-alerts-sub').textContent = s.alerts_high_30d ? `dont ${s.alerts_high_30d} critique(s)` : 'aucune critique';
+  document.getElementById('k-alerts-sub').textContent = (s.alerts_high_30d ? `actives, dont ${s.alerts_high_30d} critique(s)` : 'actives, aucune critique')
+    + (s.alerts_resolved_30d ? ` · ${s.alerts_resolved_30d} réglée(s)` : '');
   const m = s.today.slice(0, 7);
   document.getElementById('kpi-spend').onclick = () => openList('Dépenses · ' + monthLabel(m), { since: m + '-01', until: s.today, direction: 'debit' });
   document.getElementById('kpi-income').onclick = () => openList('Entrées · ' + monthLabel(m), { since: m + '-01', until: s.today, direction: 'credit' });
   const sel = document.getElementById('f-acc');
+  const keep = sel.value;  // loadSummary est rappelé après une synchro ou un « C'est bon » : on garde le filtre choisi
   sel.innerHTML = '<option value="">Tous les comptes</option>' + s.accounts.map(a => `<option value="${esc(a.id)}">${esc(bankName(a.bank))} · ${esc(a.name)}</option>`).join('');
+  sel.value = keep;
 }
 
 async function loadAlerts() {
-  const { items } = await api('/api/alerts?limit=50');
+  const { items, can_resolve } = await api('/api/alerts?limit=80');
   const box = document.getElementById('alerts');
   if (!items.length) { box.innerHTML = '<div class="empty">Aucune alerte. Tout est calme.</div>'; return; }
   const ICON = { high: '!', medium: '!', low: 'i' };
   const LABEL = { high: 'Critique', medium: 'À vérifier', low: 'Info' };
-  box.innerHTML = items.map(a => `
-    <div class="alert rowlink" data-ids="${esc((JSON.parse(a.tx_ids || '[]')).join(','))}" data-title="${esc(a.title)}">
-      <div class="ico ${a.severity}" aria-label="${LABEL[a.severity]}">${ICON[a.severity]}</div>
+  const when = d => new Date(d).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' });
+  const row = a => {
+    const done = !!a.resolved_at;
+    const how = !done ? '' : a.resolved_by === 'auto' ? ` · réglée d’elle-même le ${when(a.resolved_at)}` : ` · « c’est bon » par ${esc(a.resolved_by || '?')} le ${when(a.resolved_at)}`;
+    const act = !can_resolve ? '' : done
+      ? `<div class="acts"><button class="btn" data-reopen="${a.id}" title="Remettre l’alerte dans les actives">Rouvrir</button></div>`
+      : `<div class="acts"><button class="btn ok" data-resolve="${a.id}" title="L’alerte est réglée : elle quitte les actives et reste dans l’historique">✓ C’est bon</button></div>`;
+    return `
+    <div class="alert rowlink${done ? ' done' : ''}" data-ids="${esc((JSON.parse(a.tx_ids || '[]')).join(','))}" data-title="${esc(a.title)}">
+      <div class="ico ${done ? '' : a.severity}" aria-label="${done ? 'Réglée' : LABEL[a.severity]}">${done ? '✓' : ICON[a.severity]}</div>
       <div>
-        <div class="t">${esc(a.title)} <span class="pill">${LABEL[a.severity]}</span></div>
+        <div class="t">${esc(a.title)} <span class="pill">${done ? 'Réglée' : LABEL[a.severity]}</span></div>
         <div class="m">${esc(a.message).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</div>
-        <div class="meta">${esc(a.kind)} · ${new Date(a.created_at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}</div>
+        <div class="meta">${esc(a.kind)} · ${when(a.created_at)}${how}</div>${act}
       </div>
-    </div>`).join('');
-  box.onclick = e => {
+    </div>`;
+  };
+  const active = items.filter(a => !a.resolved_at), done = items.filter(a => a.resolved_at);
+  const wasOpen = box.querySelector('details.al-done')?.open;
+  box.innerHTML = (active.length ? active.map(row).join('') : '<div class="empty">Aucune alerte active. Tout est calme.</div>')
+    + (done.length ? `<details class="al-done"${wasOpen ? ' open' : ''}><summary>Réglées (${done.length})</summary>${done.map(row).join('')}</details>` : '');
+  box.onclick = async e => {
+    const btn = e.target.closest('button[data-resolve],button[data-reopen]');
+    if (btn) {
+      e.stopPropagation();
+      if (btn.disabled) return;
+      btn.disabled = true; btn.classList.add('busy');
+      const id = btn.dataset.resolve || btn.dataset.reopen;
+      try {
+        const r = await fetch(`/api/alerts/${id}/${btn.dataset.resolve ? 'resolve' : 'reopen'}`, { method: 'POST' });
+        if (!r.ok && r.status !== 404) throw new Error(r.status);
+      } catch (err) { btn.textContent = 'Erreur'; btn.classList.remove('busy'); return; }
+      loadAlerts(); loadSummary(); loadOverdraft();
+      return;
+    }
+    if (e.target.closest('summary')) return;
     const el = e.target.closest('.alert[data-ids]'); if (!el || !el.dataset.ids) return;
     const ids = el.dataset.ids.split(',');
     if (ids.length === 1) openDetail(ids[0]); else openList(el.dataset.title, { ids: el.dataset.ids }, 'opérations concernées');

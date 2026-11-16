@@ -41,15 +41,19 @@ def _desc(tx: Tx) -> str:
 
 # --------------------------------------------------------------------------- doublons
 def detect_duplicates(history: list[Tx], candidates: list[Tx], s: Settings = default_settings) -> list[Alert]:
-    """Même marchand + même montant + dates à ≤ N jours -> doublon probable."""
+    """Même marchand + même montant + dates à ≤ N jours -> doublon probable.
+
+    Hors virements internes et retraits d'espèces (`dup_skip_categories`) : refaire le même virement vers
+    son propre compte ou retirer deux fois 50 € n'est pas un double débit."""
     alerts: list[Alert] = []
-    debits = [t for t in history if t.is_debit and abs(t.amount) >= s.dup_min_amount]
+    skip = {c.strip() for c in s.dup_skip_categories.split(",") if c.strip()}
+    debits = [t for t in history if t.is_debit and abs(t.amount) >= s.dup_min_amount and t.category not in skip]
     by_key: dict[tuple[str, float], list[Tx]] = defaultdict(list)
     for t in debits:
         by_key[(t.merchant_key, round(abs(t.amount), 2))].append(t)
     seen: set[frozenset[str]] = set()
     for c in candidates:
-        if not c.is_debit or abs(c.amount) < s.dup_min_amount:
+        if not c.is_debit or abs(c.amount) < s.dup_min_amount or c.category in skip:
             continue
         for other in by_key.get((c.merchant_key, round(abs(c.amount), 2)), []):
             if other.id == c.id:

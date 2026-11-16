@@ -40,6 +40,19 @@ Authorization: Bearer bw_…
 `pro` vient de `rules/forecast.json` (`accounts.<banque>.pro`). `balance_estimate` = dernier solde lu
 + opérations vues depuis.
 
+### Prévision multi-horizons (`rules/forecast.json`)
+
+`views` : liste de `{name, type, days, alerts}`. `type` ∈ `rolling` (`days` jours), `month_end`
+(aujourd'hui → dernier jour du mois inclus), `next_month` (1er → dernier jour du mois suivant).
+Sans `views`, `horizon_days` reste utilisé (une seule vue, empreintes inchangées). `alerts: false` =
+vue affichée (CLI, onglet du dashboard) mais sans alerte ni recommandation. Un compte en manque sur
+plusieurs vues à alertes ne produit qu'une alerte, celle de la vue la plus exigeante (nommée dans le
+titre) ; l'empreinte ne dépend pas de la vue : `forecast:short:<compte>:<AAAA-MM>`.
+`/api/forecast` : `views` = toutes les vues (`name`, `type`, `start`, `end`, `alerts`, `default`,
+`accounts`) ; `accounts` à la racine = la vue par défaut (première vue à alertes), comme avant.
+Chaque compte porte `uncovered_from` : date du premier prélèvement non couvert (ou `null`).
+Le rapport ne porte que la vue par défaut. Contrôle du front : `node scripts/front_check.js <instance> <port>`.
+
 ### `GET /api/export/transactions`
 
 Par défaut les 90 derniers jours, comptes ignorés exclus, 5 000 lignes max (`limit` jusqu'à 20 000).

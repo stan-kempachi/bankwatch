@@ -327,10 +327,12 @@ def _notify_subscribers(results, new) -> None:
 
 
 @app.command()
-def alerts(limit: int = typer.Option(20), all: bool = typer.Option(False, "--all", help="Inclure les alertes écartées")):
+def alerts(limit: int = typer.Option(20), all: bool = typer.Option(False, "--all", help="Inclure les alertes écartées"),
+           active: bool = typer.Option(False, "--active", help="Seulement les alertes actives (ni réglées, ni écartées)")):
     """Liste les dernières alertes avec leur numéro."""
-    for a in Database().alerts(limit, include_dismissed=all):
-        flag = " (écartée)" if a["dismissed"] else ""
+    for a in Database().alerts(limit, include_dismissed=all, active_only=active):
+        flag = (" (écartée)" if a["dismissed"] else " (réglée auto)" if a["resolved_by"] == "auto"
+                else f" (réglée par {a['resolved_by']})" if a["resolved_at"] else "")
         typer.echo(f"#{a['id']:<4} [{a['severity']:6}] {a['created_at'][:10]}  {a['title']}{flag}")
         typer.echo("      " + a["message"].replace("**", "").replace("\n", " / ")[:140])
 
@@ -349,21 +351,40 @@ def dismiss(alert_id: int = typer.Argument(..., help="Numéro affiché par `bank
 
 
 @app.command()
+def resolve(alert_id: int = typer.Argument(..., help="Numéro affiché par `bankwatch alerts`"),
+            by: str = typer.Option("cli", help="Qui valide (affiché dans le dashboard)")):
+    """« C'est bon » : l'alerte est réglée, elle n'est plus active mais reste dans l'historique."""
+    typer.echo("Alerte réglée." if Database().resolve_alert(alert_id, by=by) else "Numéro inconnu ou alerte déjà réglée.")
+
+
+@app.command()
+def reopen(alert_id: int = typer.Argument(..., help="Numéro affiché par `bankwatch alerts`")):
+    """Rouvre une alerte réglée."""
+    typer.echo("Alerte rouverte." if Database().reopen_alert(alert_id) else "Numéro inconnu ou alerte déjà active.")
+
+
+@app.command()
 def forecast():
     """Prélèvements à venir et couverture par le solde de chaque compte."""
-    from .forecast import coverage, load_config
+    from .forecast import coverage, load_config, view_window
 
     cfg = load_config()
-    typer.echo(f"Horizon {cfg.horizon_days} j, marge {cfg.margin:.0f} €")
-    for c in coverage(Database(), date.today(), cfg):
-        st = "OK" if c.ok else f"IL MANQUE {c.shortfall:.2f} €"
-        typer.secho(f"\n{c.bank:12} {c.name[:28]:28} solde {c.balance:9.2f} €  à venir {c.total:8.2f} €  → {st}",
-                    fg="green" if c.ok else "red")
-        for i in c.items:
-            typer.echo(f"    {i.due:%d/%m}  {'≈' if i.estimate else ' '}{i.amount:8.2f} €  {i.label}")
-        for i in c.later:
-            typer.echo(f"    {i.due:%d/%m}  ≈{i.amount:8.2f} €  {i.label}  (hors fenêtre, à prévoir"
-                       + (f" : il manquera {c.projected_shortfall:.2f} € au solde actuel)" if c.projected_shortfall else ")"))
+    db, today = Database(), date.today()
+    typer.echo(f"Marge {cfg.margin:.0f} €")
+    for v in cfg.active_views():
+        start, end = view_window(v, today)
+        label = v.name or f"{v.days} j"
+        typer.secho(f"\n=== Vue {label} : {start:%d/%m/%Y} → {end:%d/%m/%Y}"
+                    + ("" if v.alerts else " (affichage seul, sans alerte)") + " ===", bold=True)
+        for c in coverage(db, today, cfg, v):
+            st = "OK" if c.ok else f"IL MANQUE {c.shortfall:.2f} €"
+            typer.secho(f"\n{c.bank:12} {c.name[:28]:28} solde {c.balance:9.2f} €  à venir {c.total:8.2f} €  → {st}",
+                        fg="green" if c.ok else "red")
+            for i in c.items:
+                typer.echo(f"    {i.due:%d/%m}  {'≈' if i.estimate else ' '}{i.amount:8.2f} €  {i.label}")
+            for i in c.later:
+                typer.echo(f"    {i.due:%d/%m}  ≈{i.amount:8.2f} €  {i.label}  (hors fenêtre, à prévoir"
+                           + (f" : il manquera {c.projected_shortfall:.2f} € au solde actuel)" if c.projected_shortfall else ")"))
 
 
 @app.command()

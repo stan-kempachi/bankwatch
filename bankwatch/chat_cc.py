@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -20,11 +21,13 @@ import shlex
 import shutil
 import sqlite3
 import uuid
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from . import agent as A
 from . import chat as C
 from .config import settings
 
@@ -42,6 +45,10 @@ class Req:
     is_owner: bool
     confirm: ConfirmFn
     progress: ProgressFn | None
+    author: str = ""
+    channel_id: int | None = None
+    deadline: float = 0.0  # échéance de l'invocation claude (horloge de la boucle) ; un outil long la repousse
+    approved: set[str] = field(default_factory=set)  # validations ✅ accordées, consommées par les outils d'agent
 
 
 REQUESTS: dict[str, Req] = {}
@@ -49,12 +56,17 @@ REQUESTS: dict[str, Req] = {}
 # --------------------------------------------------------------------------- serveur MCP
 
 MCP_PORT = settings.chat_mcp_port
-mcp = FastMCP("bankwatch", stateless_http=True, json_response=True, host="127.0.0.1", port=MCP_PORT,
+AGENT_MCP_PORT = settings.chat_agent_mcp_port
+# json_response=False : réponses en flux SSE. Claude Code abandonne au bout de 60 s une réponse JSON simple,
+# alors qu'une validation ✅, un `run` ou une session d'agent durent plus longtemps (voir _alive).
+mcp = FastMCP("bankwatch", stateless_http=True, json_response=False, host="127.0.0.1", port=MCP_PORT,
               instructions="Outils BankWatch et Budget du foyer. Les actions passent par une validation Discord.")
 
 # outils autorisés sans question ; tout le reste de ce serveur passe par `approuver`
 READ_TOOLS = ("etat", "bankwatch_lire", "bankwatch_sql", "budget_sql", "fichier_lire", "memoire_ajouter")
-ACTION_TOOLS = ("bankwatch_action", "regle_ecrire")
+AGENT_TOOLS = ("agent_code", "agent_deployer")  # réservés aux comptes autorisés, ✅ à chaque appel
+AGENT_IDS = C._ids(settings.chat_agent_user_ids)  # comptes autorisés en plus du propriétaire
+ACTION_TOOLS = ("bankwatch_action", "regle_ecrire", *AGENT_TOOLS)
 
 
 def _req(ctx: Context) -> Req:
@@ -72,6 +84,44 @@ def _inst(req: Req, instance: str | None) -> C.Instance:
 
 def _foreign(req: Req, inst: C.Instance) -> bool:
     return C.MULTI and req.author_id is not None and req.author_id not in inst.users
+
+
+async def _alive(ctx: Context, aw: Awaitable[Any], every: float = 15.0) -> Any:
+    """Attend `aw` en envoyant un signe de vie périodique sur le flux de la réponse (appels longs)."""
+    task = asyncio.ensure_future(aw)
+    n = 0
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=every)
+            if done:
+                return task.result()
+            n += 1
+            try:
+                await ctx.report_progress(n, None)
+            except Exception:  # noqa: BLE001 — client sans jeton de progression ou flux fermé : sans conséquence
+                pass
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def _agent_ok(req: Req) -> bool:
+    """Qui peut utiliser les outils d'agent : le propriétaire et les comptes de BW_CHAT_AGENT_USER_IDS."""
+    return req.is_owner or (req.author_id is not None and req.author_id in AGENT_IDS)
+
+
+def _akey(short: str, tool_input: dict[str, Any]) -> str:
+    keys = ("depot", "prompt") if short == "agent_code" else ("depot",)
+    blob = json.dumps([str(tool_input.get(k, "")) for k in keys], ensure_ascii=False)
+    return short + ":" + hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _need_approval(req: Req, short: str, tool_input: dict[str, Any]) -> None:
+    """Les outils d'agent vérifient eux-mêmes qu'un ✅ a été donné pour CET appel (mêmes arguments)."""
+    key = _akey(short, tool_input)
+    if key not in req.approved:
+        raise C.Refused("pas de validation ✅ pour cet appel précis (elle est demandée automatiquement quand tu appelles l'outil)")
+    req.approved.discard(key)
 
 
 def _guard(fn):
@@ -102,9 +152,9 @@ async def etat(ctx: Context, instance: str | None = None) -> str:
     return await asyncio.to_thread(C.t_etat, _inst(req, instance))
 
 
-@mcp.tool(structured_output=False, description="Commande du CLI bankwatch en lecture seule, sans validation : accounts, alerts [--all], forecast, "
+@mcp.tool(structured_output=False, description="Commande du CLI bankwatch en lecture seule, sans validation : accounts, alerts [--all] [--active], forecast, "
                       "watch, institutions <nom>, report --dry-run, user list, token list. "
-                      "Pour sync, run, dismiss, dedupe, recategorize, ignore, report, link… utilise bankwatch_action.")
+                      "Pour sync, run, resolve, reopen, dismiss, dedupe, recategorize, ignore, report, link… utilise bankwatch_action.")
 @_guard
 async def bankwatch_lire(ctx: Context, args: str, instance: str | None = None) -> str:
     req = _req(ctx)
@@ -113,12 +163,13 @@ async def bankwatch_lire(ctx: Context, args: str, instance: str | None = None) -
         argv = argv[1:]
     if C.classify_cmd(argv) != "free":
         raise C.Refused("cette commande modifie des données ou consomme du quota : passe par bankwatch_action")
-    return await C.run_bankwatch(argv, _inst(req, instance))
+    return await _alive(ctx, C.run_bankwatch(argv, _inst(req, instance)))
 
 
 @mcp.tool(structured_output=False, description="Commande du CLI bankwatch qui agit (validation ✅ demandée automatiquement à l'utilisateur dans "
                       "Discord) : sync (consomme du quota DSP2 : 1 accès transactions par compte, +1 si relecture de solde), "
-                      "run (sync + contrôles + alertes), check [--no-notify], dismiss <n°>, dedupe, recategorize, ignore <id>, "
+                      "run (sync + contrôles + alertes), check [--no-notify], resolve <n°> (« c'est bon » : alerte réglée, plus active), reopen <n°>, "
+                      "dismiss <n°> (fausse alerte, ne renaît pas), dedupe, recategorize, ignore <id>, "
                       "report --days N, notify-test, webhook-test, link <nom-court> \"<ASPSP>\" [--business] (lien de "
                       "consentement bancaire à transmettre). Ne l'appelle que si l'utilisateur a demandé l'action.")
 @_guard
@@ -136,13 +187,14 @@ async def bankwatch_action(ctx: Context, args: str, instance: str | None = None)
     if req.progress:
         tag = f"[{inst.label}] " if C.MULTI else ""
         await req.progress(f"⏳ {tag}`bankwatch {' '.join(argv)}` en cours…")
-    return await C.run_bankwatch(argv, inst)
+    return await _alive(ctx, C.run_bankwatch(argv, inst))
 
 
 @mcp.tool(structured_output=False, description="Requête SELECT en lecture seule sur la base BankWatch (SQLite). Tables : accounts(id,bank,name,iban,"
                       "balance,balance_date,last_sync,ignored), transactions(id,account_id,booking_date,value_date,amount,"
                       "counterparty,label,category,status[booked|pending],first_seen ; NE PAS sélectionner la colonne raw), "
-                      "alerts(id,kind,severity,title,message,amount,tx_ids,created_at,sent_at,dismissed), meta(key,value). "
+                      "alerts(id,kind,severity,title,message,amount,tx_ids,created_at,sent_at,dismissed,resolved_at,resolved_by[auto|nom] ; "
+                      "active = dismissed=0 AND resolved_at IS NULL), meta(key,value). "
                       "Montants : débit négatif. Dates ISO. 200 lignes max.")
 @_guard
 async def bankwatch_sql(ctx: Context, sql: str, instance: str | None = None) -> str:
@@ -192,6 +244,80 @@ async def memoire_ajouter(ctx: Context, note: str) -> str:
     return C.t_memoire_ajouter(note)
 
 
+def _who(req: Req, tool_input: dict[str, Any]) -> dict[str, Any]:
+    return {"auteur_id": req.author_id, "auteur": req.author, "depot": str(tool_input.get("depot", ""))[:60],
+            "prompt": tool_input.get("prompt")}
+
+
+async def _detached(req: Req, coro: Awaitable[str], ctx: Context) -> str:
+    """Un travail long ne doit pas mourir avec l'appel MCP : si l'appel est coupé (délai côté Claude Code,
+    assistant interrompu), le travail va au bout et son compte rendu est posté dans le salon."""
+    task = asyncio.ensure_future(coro)
+    try:
+        return await _alive(ctx, asyncio.shield(task))
+    except asyncio.CancelledError:
+        def late(t: asyncio.Task) -> None:
+            if req.progress and not t.cancelled():
+                text = f"⚠️ {t.exception()}" if t.exception() else str(t.result())
+                asyncio.ensure_future(req.progress(text[:1900]))
+        task.add_done_callback(late)
+        raise
+
+
+@mcp.tool(structured_output=False, description="Délègue une modification de CODE à une session Claude Code séparée, enfermée dans un bac à sable. "
+                      "Réservé au propriétaire du bot et aux comptes autorisés ; une validation ✅ affichant le dépôt et le prompt est demandée "
+                      "automatiquement à chaque appel. depot : un nom de la liste blanche (" + (", ".join(A.depot_names()) or "aucun configuré")
+                      + "), jamais un chemin. prompt : la demande complète et autonome, en français — l'agent ne voit pas cette "
+                      f"conversation ({settings.chat_agent_max_prompt} caractères max, montré tel quel dans la validation). "
+                      "L'agent travaille dans un clone, sur une branche agent/<date>-<slug>, un commit par étape, avec les seuls "
+                      "outils Read/Grep/Glob/Edit/Write et git/pytest/ruff, sans réseau ; rien n'est fusionné, poussé ni "
+                      f"redémarré. Dure jusqu'à {settings.chat_agent_timeout // 60} min. Renvoie les commits, les fichiers modifiés et le "
+                      "résultat des tests : relaie-les fidèlement. Ne l'appelle que si un compte autorisé demande explicitement de "
+                      "modifier du code.")
+@_guard
+async def agent_code(ctx: Context, depot: str, prompt: str) -> str:
+    req = _req(ctx)
+    args = {"depot": depot, "prompt": prompt}
+    if not _agent_ok(req):
+        A.journal_add("agent_code", "refusé", detail="compte non autorisé", **_who(req, args))
+        raise C.Refused("agent_code est réservé aux comptes autorisés")
+    _need_approval(req, "agent_code", args)
+    req.deadline = max(req.deadline, asyncio.get_running_loop().time() + settings.chat_agent_timeout + 480)
+    if req.progress:
+        await req.progress(f"🛠️ Agent lancé sur `{depot}` (jusqu'à {settings.chat_agent_timeout // 60} min). Compte rendu à la fin.")
+    return await _detached(req, A.agent_code(depot, prompt, author_id=req.author_id, author=req.author), ctx)
+
+
+@mcp.tool(structured_output=False, description="Déploie la dernière branche produite par agent_code pour ce dépôt : fusion dans la branche "
+                      "principale, redémarrage des services, test de santé, et retour automatique au commit précédent si le "
+                      "test échoue. Réservé au propriétaire du bot et aux comptes autorisés ; validation ✅ séparée, demandée automatiquement, qui "
+                      "affiche la branche, les commits et les services. depot : un nom de la liste blanche ("
+                      + (", ".join(A.depot_names()) or "aucun configuré") + "). L'outil rend la main dès le lancement ; le compte "
+                      "rendu est posté dans le salon par le script de déploiement (le bot peut redémarrer entre-temps). "
+                      "Ne l'appelle que si un compte autorisé demande explicitement de déployer.")
+@_guard
+async def agent_deployer(ctx: Context, depot: str) -> str:
+    req = _req(ctx)
+    args = {"depot": depot}
+    if not _agent_ok(req):
+        A.journal_add("agent_deployer", "refusé", detail="compte non autorisé", **_who(req, args))
+        raise C.Refused("agent_deployer est réservé aux comptes autorisés")
+    _need_approval(req, "agent_deployer", args)
+    return await A.agent_deployer(depot, author_id=req.author_id, author=req.author, channel_id=req.channel_id)
+
+
+async def _describe_agent(short: str, tool_input: dict[str, Any]) -> tuple[str, str]:
+    """(titre, détail) de la validation d'un outil d'agent ; lève Refused si l'appel est irrecevable."""
+    if short == "agent_code":
+        d = A.get_depot(str(tool_input.get("depot", "")))
+        prompt = A.check_prompt(str(tool_input.get("prompt", ""))).replace("`" * 3, "'''")
+        return (f"agent_code → dépôt « {d.name} »",
+                f"Prompt transmis à l'agent :\n```\n{prompt}\n```\nSession Claude Code séparée, en bac à sable, sur une branche "
+                f"`agent/…` ; {settings.chat_agent_timeout // 60} min max ; ni réseau, ni push, ni fusion.")
+    plan = await A.deploy_plan(str(tool_input.get("depot", "")))
+    return f"agent_deployer → dépôt « {plan['depot'].name} »", A.plan_text(plan)
+
+
 def _describe(tool_name: str, tool_input: dict[str, Any], req: Req) -> tuple[str, str]:
     """(titre, détail) de la demande de validation, d'après l'outil et ses arguments."""
     inst = C.instance_for(req.author_id, tool_input.get("instance"))
@@ -217,25 +343,83 @@ async def approuver(ctx: Context, tool_name: str, input: dict[str, Any], tool_us
         return json.dumps({"behavior": "deny", "message": f"outil {tool_name} non autorisé depuis Discord"})
     if short == "regle_ecrire" and not req.is_owner:
         return json.dumps({"behavior": "deny", "message": "seul le propriétaire peut modifier les règles"})
+    agent = short in AGENT_TOOLS
+    if agent and not _agent_ok(req):
+        A.journal_add(short, "refusé", detail="compte non autorisé", **_who(req, input))
+        return json.dumps({"behavior": "deny", "message": f"{short} est réservé aux comptes autorisés : indisponible pour cette personne"})
     try:
-        title, detail = _describe(tool_name, input, req)
+        title, detail = await _describe_agent(short, input) if agent else _describe(tool_name, input, req)
     except C.Refused as e:
+        if agent:
+            A.journal_add(short, "refusé", detail=str(e), **_who(req, input))
         return json.dumps({"behavior": "deny", "message": str(e)})
-    ok = await req.confirm(title, detail)
+    ok = await _alive(ctx, req.confirm(title, detail))
     if ok:
+        if agent:
+            req.approved.add(_akey(short, input))
         return json.dumps({"behavior": "allow", "updatedInput": input})
+    if agent:
+        A.journal_add(short, "non validé", detail="bouton ✅ refusé ou délai dépassé", **_who(req, input))
     return json.dumps({"behavior": "deny", "message": "non validé par l'utilisateur (bouton ✅ refusé ou délai dépassé)"})
 
 
-async def serve_mcp() -> None:
-    """Lance le serveur MCP HTTP dans la boucle courante (à côté de discord.py)."""
+# --------------------------------------------------------------------------- serveur MCP de la session d'agent
+
+mcp_depot = FastMCP("depot", stateless_http=True, json_response=False, host="127.0.0.1", port=AGENT_MCP_PORT,
+                    instructions="git, pytest et ruff dans le dépôt de travail, exécutés sans réseau.")
+
+
+def _run_of(ctx: Context) -> A.Run:
+    request = ctx.request_context.request
+    rid = request.headers.get("x-bw-req") if request is not None else None
+    run = A.RUNS.get(rid or "")
+    if run is None:
+        raise C.Refused("session d'agent inconnue ou terminée")
+    return run
+
+
+@mcp_depot.tool(name="git", structured_output=False, description="git dans le dépôt de travail. args = sous-commande et arguments, par ex. "
+                "`status --short`, `diff`, `log --oneline -10`, `add chemin/fichier.py`, `commit -m \"zone : changement\"`. "
+                "Sous-commandes disponibles : " + ", ".join(A.GIT_OK) + ".")
+@_guard
+async def depot_git(ctx: Context, args: str) -> str:
+    return await A.tool_git(_run_of(ctx), args)
+
+
+@mcp_depot.tool(name="pytest", structured_output=False, description="Lance pytest dans le dépôt de travail (sans réseau, 5 min max). "
+                "args = arguments de pytest, par ex. `-q`, `tests/test_x.py -q`, `-k motif -x`. Par défaut : -q.")
+@_guard
+async def depot_pytest(ctx: Context, args: str = "") -> str:
+    return await _alive(ctx, A.tool_pytest(_run_of(ctx), args))
+
+
+@mcp_depot.tool(name="ruff", structured_output=False, description="Lance ruff dans le dépôt de travail. args = `check [chemins]`, "
+                "`check --fix [chemins]` ou `format [chemins]`. Par défaut : check .")
+@_guard
+async def depot_ruff(ctx: Context, args: str = "") -> str:
+    return await _alive(ctx, A.tool_ruff(_run_of(ctx), args))
+
+
+@mcp_depot.tool(name="approuver", structured_output=False, description="Outil interne de Claude Code : demande de permission. Ne pas appeler directement.")
+async def depot_approuver(ctx: Context, tool_name: str, input: dict[str, Any], tool_use_id: str | None = None) -> str:
+    """Dans une session d'agent, personne ne valide : tout ce qui n'est pas pré-autorisé est refusé."""
+    return json.dumps({"behavior": "deny", "message": "non autorisé dans cette session : seuls Read, Grep, Glob, Edit, Write "
+                       "(dans le dépôt de travail) et les outils git, pytest, ruff sont disponibles"})
+
+
+async def _serve(server_def: FastMCP, port: int) -> None:
     import uvicorn
 
-    app = mcp.streamable_http_app()
-    config = uvicorn.Config(app, host="127.0.0.1", port=MCP_PORT, log_level="warning", lifespan="on")
+    config = uvicorn.Config(server_def.streamable_http_app(), host="127.0.0.1", port=port, log_level="warning", lifespan="on")
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
     await server.serve()
+
+
+async def serve_mcp() -> None:
+    """Lance les serveurs MCP HTTP dans la boucle courante (à côté de discord.py) : celui de l'assistant
+    et celui, séparé, des commandes d'une session d'agent."""
+    await asyncio.gather(_serve(mcp, MCP_PORT), _serve(mcp_depot, AGENT_MCP_PORT))
 
 
 # --------------------------------------------------------------------------- sessions (une par salon)
@@ -285,7 +469,14 @@ def system_prompt(authors: str) -> str:
              "n'appelle cet outil que si l'action a été explicitement demandée), `bankwatch_sql`, `budget_sql`, "
              "`fichier_lire`, `regle_ecrire`, `memoire_ajouter`. Si un outil répond REFUSÉ ou qu'une permission est "
              "refusée, dis-le simplement et propose la suite. Tu n'as aucun accès au système de fichiers ni au shell : "
-             "ne prétends jamais avoir exécuté autre chose que ces outils.\n")
+             "ne prétends jamais avoir exécuté autre chose que ces outils.\n"
+             "Code (réservé à " + ", ".join(f"<@{i}>" for i in sorted({C.OWNER_ID} | AGENT_IDS))
+             + ", sur demande explicite) : `agent_code(depot, prompt)` confie "
+             "une modification de code à un agent séparé qui travaille sur une branche, sans rien déployer ; "
+             "`agent_deployer(depot)` fusionne ensuite cette branche et redémarre le service. Dépôts autorisés : "
+             + (", ".join(A.depot_names()) or "aucun") + ". Rédige pour l'agent un prompt complet et fidèle à la demande, sans "
+             "rien y ajouter de ton cru ; ne déploie jamais dans la foulée sans qu'on te le demande ; pour toute autre "
+             "personne, réponds que ces deux outils ne lui sont pas ouverts.\n")
     return C.system_prompt(authors) + extra
 
 
@@ -311,7 +502,8 @@ class CCAgent:
     async def run(self, scope: str, text: str, author: str, is_owner: bool, authors: str,
                   confirm: ConfirmFn, progress: ProgressFn | None = None, author_id: int | None = None) -> str:
         rid = uuid.uuid4().hex
-        REQUESTS[rid] = Req(author_id, is_owner, confirm, progress)
+        REQUESTS[rid] = Req(author_id, is_owner, confirm, progress, author=author,
+                            channel_id=int(scope) if scope.isdigit() else None)
         try:
             async with self._lock(scope):
                 return await self._run(rid, scope, text, author, authors)
@@ -334,15 +526,22 @@ class CCAgent:
         # ni clé API (sinon elle prime sur l'abonnement), ni variables BankWatch
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("BW_", "ANTHROPIC_", "CLAUDE_CODE_")) and k not in ("ANTHROPIC_API_KEY",)}
-        env.update(TERM="dumb", NO_COLOR="1", CI="1")
+        env.update(TERM="dumb", NO_COLOR="1", CI="1", MCP_TOOL_TIMEOUT=str((settings.chat_agent_timeout + 600) * 1000))
         C.history_add(scope, "user", text, author)
         proc = await asyncio.create_subprocess_exec(*args, cwd=str(self.cwd), env=env,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=settings.chat_cc_timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return f"⏱️ Claude Code n'a pas répondu en {settings.chat_cc_timeout}s ; j'ai interrompu."
+        # échéance repoussable : agent_code la prolonge de la durée d'une session d'agent
+        loop, req = asyncio.get_running_loop(), REQUESTS[rid]
+        req.deadline = loop.time() + settings.chat_cc_timeout
+        comm = asyncio.ensure_future(proc.communicate())
+        while not comm.done():
+            left = req.deadline - loop.time()
+            if left <= 0:
+                proc.kill()
+                await comm
+                return "⏱️ Claude Code n'a pas répondu à temps ; j'ai interrompu."
+            await asyncio.wait({comm}, timeout=min(left, 30))
+        out, err = comm.result()
         raw = out.decode("utf-8", "replace").strip()
         try:
             data = json.loads(raw)

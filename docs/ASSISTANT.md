@@ -40,3 +40,57 @@ dans son dossier, avec son venv et un environnement purgé des variables `BW_*`.
 `BW_CHAT_CC_TIMEOUT` (600 s, inclut l'attente d'une validation), `BW_CHAT_MCP_PORT` (8121),
 `BW_CHAT_INSTANCES_FILE` (`data/chat_instances.json`). Test sans Discord :
 `python -m bankwatch.chat --test "question"` (validations refusées).
+
+## Délégation de code : `agent_code` et `agent_deployer`
+
+Deux outils du serveur MCP du bot (port `BW_CHAT_MCP_PORT`), réservés au **propriétaire** (`BW_CHAT_OWNER_ID`) et aux
+comptes listés dans `BW_CHAT_AGENT_USER_IDS` (les autres droits du propriétaire ne sont pas étendus), et
+soumis à une validation ✅ **à chaque appel** via `--permission-prompt-tool` ; les outils revérifient eux-mêmes
+qu'un ✅ a bien été donné pour ces arguments précis. Code : `bankwatch/agent.py`, `deploy/agent_deploy.py`.
+
+### `agent_code(depot, prompt)`
+
+- `depot` est une clé de la liste blanche `data/agent_depots.json` (hors git), jamais un chemin. Le prompt
+  (1 500 caractères max) est affiché **en entier** dans la demande de validation, avec le dépôt.
+- Le bot clone la branche principale dans `~/agent-work/<depot>` et y crée `agent/<date>-<slug>`. **Le dépôt en
+  service n'est pas touché pendant la session** : un service ou un timer qui redémarre ne peut pas exécuter du
+  code non relu.
+- Une session `claude -p` séparée de celle de l'assistant tourne dans un bac à sable bubblewrap : elle ne voit
+  que le clone (ni `.env`, ni `data/`, ni le reste de `$HOME`, ni `~/.claude` — elle reçoit seulement le jeton
+  d'accès court de l'abonnement). Outils intégrés : `Read`, `Grep`, `Glob`, `Edit`, `Write`, rien d'autre.
+- Le « Bash restreint » est remplacé par trois outils MCP (second serveur local, `BW_CHAT_AGENT_MCP_PORT`) que
+  le bot exécute sans shell, dans un second bac à sable **sans réseau** : `git` (status, diff, log, show, add,
+  commit, rm, mv, restore), `pytest`, `ruff`. Pourquoi pas le Bash de Claude Code : `pytest` exécute du code
+  arbitraire, donc un filtrage par motif de commande ne garantit rien ; ici c'est le noyau qui interdit le
+  réseau, sudo (no_new_privs), systemctl (pas de D-Bus) et toute écriture hors du clone.
+- Durée maximale `BW_CHAT_AGENT_TIMEOUT` (600 s). À la fin, le bot commite un éventuel reliquat, relance pytest
+  et ruff lui-même, puis rapatrie la branche dans le dépôt en service par un bundle git (des données, aucun
+  hook ni configuration du clone n'est exécuté). **Ni fusion, ni push.** La réponse est tronquée : commits,
+  fichiers modifiés, statistiques du diff, résultat des tests, compte rendu de l'agent.
+
+### `agent_deployer(depot)`
+
+- Déploie la dernière branche d'agent du dépôt, avec son propre ✅ (branche, commits, services affichés).
+  Refus si la session n'est pas « ok », si les tests échouent, si la branche a bougé depuis, si le dépôt en
+  service n'est pas sur la branche principale ou si un fichier de dépendances est modifié.
+- Le travail est fait par `deploy/agent_deploy.py` dans une unité systemd transitoire (le bot peut faire partie
+  des services redémarrés) : fusion `--no-ff`, alignement des clones « suivants », redémarrage, tests de santé
+  (`url`, `unit` actif et non relancé par systemd, `port`). Un test en échec → `git reset --keep` vers le commit
+  précédent (les modifications locales non commitées sont préservées), redémarrage, nouvelle vérification.
+  Le compte rendu est posté dans le salon.
+
+### Journal
+
+Table `agent_journal` de `data/chat.db` : une ligne par appel, refus compris (qui, quand, dépôt, prompt, statut,
+branche, commits de base et de tête, fichiers touchés, tests, durée, date de déploiement). La configuration
+Claude isolée et la transcription de chaque session sont gardées 30 jours dans `data/agent-runs/`.
+
+```json
+{"mon-depot": {"repo": "/chemin/du/depot", "venv": "/chemin/du/depot/.venv", "branche": "main",
+               "services": ["mon-service.service"],
+               "health": [{"url": "http://127.0.0.1:8000/healthz"}, {"unit": "mon-service.service"}],
+               "suivants": [], "deps": ["pyproject.toml"]}}
+```
+
+Les réponses du serveur MCP sont en flux SSE (`json_response=False`) avec un signe de vie périodique : Claude
+Code abandonne au bout de 60 s une réponse JSON simple, ce qui coupait aussi les validations ✅ tardives.

@@ -223,3 +223,35 @@ def test_sync_status_and_manual_sync_permissions(client, monkeypatch):
     assert client.post("/api/sync/acc-bourso", headers=basic("lea", pwd)).status_code == 403
     monkeypatch.setattr(settings, "provider", "enablebanking")
     assert client.post("/api/sync/inconnu", headers=h).status_code in (400, 404)  # pas de clé EB en test, ou compte inconnu
+
+
+def test_alert_resolve_button(client):
+    """« C'est bon » : admin seulement ; l'alerte quitte les actives, reste listée comme réglée, peut être rouverte."""
+    from bankwatch import users
+
+    h = basic("admin", "s3cret-pass")
+    d = client.get("/api/alerts", headers=h).json()
+    assert d["can_resolve"] is True and d["items"] and all(a["resolved_at"] is None for a in d["items"])
+    aid = d["items"][0]["id"]
+    before = client.get("/api/summary", headers=h).json()
+    st0 = client.get("/api/alerts/stats", headers=h).json()
+
+    pwd = users.add("lea")
+    hv = basic("lea", pwd)
+    assert client.get("/api/alerts", headers=hv).json()["can_resolve"] is False
+    assert client.post(f"/api/alerts/{aid}/resolve", headers=hv).status_code == 403
+    assert client.post(f"/api/alerts/{aid}/reopen", headers=hv).status_code == 403
+
+    assert client.post(f"/api/alerts/{aid}/resolve", headers=h).json() == {"ok": True}
+    assert client.post(f"/api/alerts/{aid}/resolve", headers=h).status_code == 404  # déjà réglée
+    assert client.post("/api/alerts/999999/resolve", headers=h).status_code == 404
+    item = next(a for a in client.get("/api/alerts", headers=h).json()["items"] if a["id"] == aid)
+    assert item["resolved_at"] and item["resolved_by"] == "admin"
+    after = client.get("/api/summary", headers=h).json()
+    assert after["alerts_30d"] == before["alerts_30d"] - 1 and after["alerts_resolved_30d"] == 1
+    st = client.get("/api/alerts/stats", headers=h).json()
+    assert st["resolved"] == 1 and st["active"] == st0["active"] - 1 and st["total"] == st0["total"]
+    assert all(k["active"] == k["high"] + k["medium"] + k["low"] for k in st["kinds"])
+
+    assert client.post(f"/api/alerts/{aid}/reopen", headers=h).json() == {"ok": True}
+    assert client.get("/api/summary", headers=h).json()["alerts_30d"] == before["alerts_30d"]

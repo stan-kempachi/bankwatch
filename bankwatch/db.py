@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -178,6 +179,12 @@ class Database:
         if "dismissed" not in acols:  # migration : alertes écartées (fausses alertes, gardées pour ne pas renaître)
             self.conn.execute("ALTER TABLE alerts ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0")
             self.conn.commit()
+        if "resolved_at" not in acols:
+            # migration : alertes réglées (« c'est bon » ou situation rentrée dans l'ordre) — elles restent dans
+            # l'historique mais ne sont plus actives. cleared_at = la situation a réellement disparu (sert à rouvrir).
+            for col in ("resolved_at", "resolved_by", "cleared_at"):
+                self.conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} TEXT")
+            self.conn.commit()
 
     # ----------------------------------------------------------------- meta
     def get_meta(self, key: str, default: str | None = None) -> str | None:
@@ -317,6 +324,63 @@ class Database:
         self.conn.commit()
         return new
 
+    _NO_REF = "json_extract(raw,'$.transactionId') IS NULL AND json_extract(raw,'$.internalTransactionId') IS NULL"
+
+    def fold_drifting_pending(self, txs: list[Tx], window_days: int = 10) -> list[Tx]:
+        """Rattache une opération « en attente » sans référence à celle déjà en base quand seule sa date a bougé.
+
+        Certaines banques (SG) ne donnent ni identifiant ni date d'opération tant que c'est en attente : la date
+        renvoyée est celle du jour de l'interrogation, elle avance donc chaque jour et l'empreinte change. Sans ce
+        rattachement, le même retrait est enregistré une fois par jour (faux doublon, solde estimé faussé).
+        Si la banque renvoie en même temps l'ancienne et la nouvelle ligne, ce sont deux opérations : rien n'est plié.
+        Modifie les Tx en place (id et date de la ligne existante) et retourne la liste."""
+        groups: dict[tuple[str, float, str], dict[str, Tx]] = defaultdict(dict)
+        for tx in txs:
+            if tx.status == "pending" and not (tx.raw.get("transactionId") or tx.raw.get("internalTransactionId")):
+                groups[(tx.account_id, round(tx.amount, 2), tx.label)].setdefault(tx.id, tx)
+        for (acc, amount, label), items in groups.items():
+            lo = min(t.booking_date for t in items.values()) - timedelta(days=window_days)
+            rows = self.conn.execute(
+                f"""SELECT id, booking_date FROM transactions WHERE account_id=? AND status='pending'
+                    AND abs(amount - ?) < 0.005 AND label=? AND booking_date >= ? AND {self._NO_REF}
+                    ORDER BY booking_date""", (acc, amount, label, lo.isoformat())).fetchall()
+            known = {r["id"] for r in rows}
+            free = [r for r in rows if r["id"] not in items]           # en base, plus renvoyée sous cette date
+            fresh = sorted((t for t in items.values() if t.id not in known), key=lambda t: t.booking_date)
+            for tx in fresh:
+                older = [r for r in free if r["booking_date"] <= tx.booking_date.isoformat()]
+                if not older:
+                    continue
+                row = older[0]
+                free.remove(row)
+                tx.id, tx.booking_date = row["id"], date.fromisoformat(row["booking_date"])
+        return txs
+
+    def purge_vanished_pending(self, account_id: str, seen_ids: Iterable[str], window_start: date,
+                               today: date | None = None, stale_days: int = 30) -> tuple[int, int]:
+        """Les opérations en attente sont une photo : celles que la banque ne renvoie plus ne sont plus en attente
+        (comptabilisées sous une autre ligne, annulées, autorisation expirée). On les retire, et les alertes
+        qui les citaient sont réglées. À n'appeler qu'après une lecture réussie et non vide du compte.
+
+        Seules sont jugées les lignes datées dans la fenêtre lue (`window_start`) — on ne peut rien dire des
+        autres — plus celles de plus de `stale_days` jours, qui ne peuvent plus être en attente.
+        Retourne (opérations retirées, alertes réglées)."""
+        seen = set(seen_ids)
+        stale = ((today or date.today()) - timedelta(days=stale_days)).isoformat()
+        rows = self.conn.execute(
+            "SELECT id FROM transactions WHERE account_id=? AND status='pending' AND (booking_date >= ? OR booking_date < ?)",
+            (account_id, window_start.isoformat(), stale)).fetchall()
+        gone = [r["id"] for r in rows if r["id"] not in seen]
+        settled = 0
+        for tid in gone:
+            self.conn.execute("DELETE FROM transactions WHERE id=?", (tid,))
+            cur = self.conn.execute(
+                "UPDATE alerts SET resolved_at=?, resolved_by='auto', sent_at=COALESCE(sent_at, ?) "
+                "WHERE dismissed=0 AND resolved_at IS NULL AND tx_ids LIKE ?", (_now(), _now(), f"%{json.dumps(tid)}%"))
+            settled += cur.rowcount
+        self.conn.commit()
+        return len(gone), settled
+
     def dedupe_pending(self) -> tuple[int, int]:
         """Supprime les « en attente » qui ont un jumeau comptabilisé ; écarte les alertes doublon qui les citaient.
         Retourne (transactions supprimées, alertes écartées)."""
@@ -406,17 +470,41 @@ class Database:
     # ---------------------------------------------------------------- alerts
     def add_alert(
         self, fingerprint: str, kind: str, severity: str, title: str, message: str,
-        amount: float | None = None, tx_ids: list[str] | None = None,
+        amount: float | None = None, tx_ids: list[str] | None = None, reopen: bool = False,
+        settled: bool = False,
     ) -> bool:
-        """Retourne True si l'alerte est nouvelle (pas déjà émise)."""
+        """Retourne True si l'alerte est nouvelle (pas déjà émise).
+
+        reopen=True (alertes d'état : manque, découvert…) : si la même alerte avait été close parce que la
+        situation avait disparu (cleared_at), elle est rouverte avec les chiffres du jour et renotifiée.
+        Une alerte écartée comme fausse ne renaît jamais.
+
+        settled=True (bonnes nouvelles : « prélèvements couverts ✓ ») : l'alerte est enregistrée déjà réglée —
+        elle part quand même sur Discord, mais ne demande aucune validation."""
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO alerts(fingerprint,kind,severity,title,message,amount,tx_ids,created_at)
                VALUES(?,?,?,?,?,?,?,?)""",
             (fingerprint, kind, severity, title, message, amount,
              json.dumps(tx_ids or []), _now()),
         )
+        created = cur.rowcount == 1
+        if created and settled:
+            self.conn.execute("UPDATE alerts SET resolved_at=?, resolved_by='auto' WHERE fingerprint=?", (_now(), fingerprint))
+        if not created and reopen:
+            cur = self.conn.execute(
+                """UPDATE alerts SET severity=?, title=?, message=?, amount=?, created_at=?, sent_at=NULL,
+                          resolved_at=NULL, resolved_by=NULL, cleared_at=NULL
+                   WHERE fingerprint=? AND dismissed=0 AND cleared_at IS NOT NULL""",
+                (severity, title, message, amount, _now(), fingerprint))
+            created = cur.rowcount == 1
+            if not created:
+                # situation toujours en cours : titre et chiffres du jour, sans renotifier ni défaire un « C'est bon »
+                self.conn.execute(
+                    "UPDATE alerts SET severity=?, title=?, message=?, amount=? "
+                    "WHERE fingerprint=? AND dismissed=0 AND cleared_at IS NULL",
+                    (severity, title, message, amount, fingerprint))
         self.conn.commit()
-        return cur.rowcount == 1
+        return created
 
     def unsent_alerts(self) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -432,11 +520,52 @@ class Database:
         )
         self.conn.commit()
 
-    def alerts(self, limit: int = 100, include_dismissed: bool = False) -> list[sqlite3.Row]:
-        where = "" if include_dismissed else "WHERE dismissed = 0 "
+    def alerts(self, limit: int = 100, include_dismissed: bool = False, active_only: bool = False) -> list[sqlite3.Row]:
+        """Dernières alertes. active_only : ni écartées, ni réglées."""
+        conds = []
+        if not include_dismissed or active_only:
+            conds.append("dismissed = 0")
+        if active_only:
+            conds.append("resolved_at IS NULL")
+        where = ("WHERE " + " AND ".join(conds) + " ") if conds else ""
         return self.conn.execute(
             f"SELECT * FROM alerts {where}ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    def resolve_alert(self, alert_id: int, by: str = "manuel") -> bool:
+        """« C'est bon » : l'alerte reste dans l'historique mais n'est plus active."""
+        cur = self.conn.execute(
+            "UPDATE alerts SET resolved_at=?, resolved_by=?, sent_at=COALESCE(sent_at, ?) "
+            "WHERE id=? AND dismissed=0 AND resolved_at IS NULL", (_now(), by, _now(), alert_id))
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def reopen_alert(self, alert_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE alerts SET resolved_at=NULL, resolved_by=NULL, cleared_at=NULL WHERE id=? AND resolved_at IS NOT NULL",
+            (alert_id,))
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def clear_stale(self, kinds: Iterable[str], live_fingerprints: Iterable[str]) -> int:
+        """Clôt les alertes d'état dont la situation a disparu (plus émises par les détecteurs).
+
+        Marque cleared_at (pour pouvoir rouvrir si ça revient) ; si personne ne l'avait réglée à la main,
+        elle est réglée « auto ». Une alerte pas encore envoyée ne le sera pas : elle est déjà périmée."""
+        kinds, live = list(kinds), set(live_fingerprints)
+        if not kinds:
+            return 0
+        rows = self.conn.execute(
+            f"SELECT id, fingerprint FROM alerts WHERE dismissed=0 AND cleared_at IS NULL "
+            f"AND kind IN ({','.join('?' * len(kinds))})", kinds).fetchall()
+        stale = [r["id"] for r in rows if r["fingerprint"] not in live]
+        now = _now()
+        self.conn.executemany(
+            "UPDATE alerts SET cleared_at=?, resolved_at=COALESCE(resolved_at, ?), "
+            "resolved_by=COALESCE(resolved_by, 'auto'), sent_at=COALESCE(sent_at, ?) WHERE id=?",
+            [(now, now, now, i) for i in stale])
+        self.conn.commit()
+        return len(stale)
 
     def dismiss_alert(self, alert_id: int) -> bool:
         cur = self.conn.execute("UPDATE alerts SET dismissed=1, sent_at=COALESCE(sent_at, ?) WHERE id=?", (_now(), alert_id))

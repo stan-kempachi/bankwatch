@@ -408,3 +408,113 @@ def test_wallet_excluded_from_coverage_and_recommendations(tmp_path):
     db.set_balance("acc-pp", 0.0, date(2026, 11, 6))
     assert {c.bank for c in coverage(db, today=date(2026, 11, 6))} == {"boursobank"}
     assert all("paypal" not in (a.message or "").lower() for a in detect_recommendations(db, date(2026, 11, 6)))
+
+
+def test_duplicate_ignores_internal_transfers_and_cash_withdrawals():
+    """Deux virements vers son propre compte ou deux retraits du même montant ne sont pas un double débit."""
+    v1, v2 = (tx(1, TODAY, -50, "DUPONT LEA", cat="epargne_virement"),
+              tx(2, TODAY - timedelta(days=2), -50, "DUPONT LEA", cat="epargne_virement"))
+    r1, r2 = tx(3, TODAY, -50, "RETRAIT DAB", cat="retrait"), tx(4, TODAY - timedelta(days=1), -50, "RETRAIT DAB", cat="retrait")
+    m1, m2 = tx(5, TODAY, -50, "CARREFOUR", cat="courses"), tx(6, TODAY - timedelta(days=1), -50, "CARREFOUR", cat="courses")
+    hist = [v1, v2, r1, r2, m1, m2]
+    alerts = detect_duplicates(hist, hist, S)
+    assert [sorted(a.tx_ids) for a in alerts] == [["t5", "t6"]]  # le vrai double débit marchand reste signalé
+
+
+def test_wallet_pairs_late_debit_refund_and_installments(tmp_path):
+    """Prélèvement 4 jours après l'achat, remboursement reversé 10 jours plus tard, paiement en 4 fois."""
+    from bankwatch.db import Database, Tx
+    from bankwatch.sync import mark_wallet_pairs
+
+    db = Database(tmp_path / "w2.db")
+    db.upsert_account(id="acc-bank", bank="fortuneo", institution_id="X", requisition_id=None, iban="FR7611111", name="Courant", currency="EUR")
+    db.upsert_account(id="acc-pp", bank="paypal", institution_id="X", requisition_id=None, iban=None, name="PayPal", currency="EUR")
+    d = date(2026, 9, 27)
+    loan = {"_eb": {"bank_transaction_code": {"code": "PAYMENT", "sub_code": "LOAN"}}}
+
+    def tx(i, acc, amount, label, day=0, cp="", cat="autre", raw=None):
+        return Tx(id=i, account_id=acc, booking_date=d + timedelta(days=day), value_date=None, amount=amount,
+                  currency="EUR", counterparty=cp, label=label, category=cat, status="booked", raw=raw or {})
+
+    db.upsert_transactions([
+        # prélèvement SEPA arrivé 4 jours après l'achat
+        tx("p-ms", "acc-pp", -13.0, "Microsoft Payments", day=-9, cp="Microsoft Payments", cat="abonnements"),
+        tx("b-ms", "acc-bank", -13.0, "PRLV PayPal Europe S.a.r.l. et C", day=-5),
+        # remboursement PayPal reversé sur le compte 10 jours plus tard
+        tx("p-ref", "acc-pp", 1.4, "CARREFOUR Drive", day=-20, cp="CARREFOUR Drive", cat="courses"),
+        tx("b-ref", "acc-bank", 1.4, "VIR PayPal Europe S.a.r.l. et Ci", day=-10, cat="revenus"),
+        tx("b-vir", "acc-bank", 30.0, "VIR PayPal Europe S.a.r.l. et Ci", day=-10, cat="revenus"),   # sans jumeau : compté
+        # billets payés en 4 fois : l'achat entier + les échéances
+        tx("p-buy", "acc-pp", -2359.95, "SNCF Voyageurs", cp="SNCF Voyageurs", cat="transport"),
+        tx("p-l1", "acc-pp", -589.99, "PayPal Inc.", cp="PayPal Inc.", raw=loan),
+        tx("b-l1", "acc-bank", -589.99, "PRLV PayPal Europe S.a.r.l. et C", day=2),
+        tx("p-l2", "acc-pp", -589.99, "PayPal Inc.", day=29, cp="PayPal Inc.", raw=loan),
+        tx("b-l2", "acc-bank", -589.99, "PRLV PayPal Europe S.a.r.l. et C", day=33),
+        tx("p-l9", "acc-pp", -220.51, "PayPal Inc.", day=0, cp="PayPal Inc.", raw=loan),             # autre échéancier, achat inconnu
+    ])
+    db.commit()
+    since = date(2026, 9, 1)
+    assert mark_wallet_pairs(db, since=since) > 0
+    cats = {t.id: t.category for t in db.transactions(since=since)}
+    assert cats["b-ms"] == "epargne_virement" and cats["p-ms"] == "abonnements"
+    assert cats["b-ref"] == "epargne_virement" and cats["p-ref"] == "courses"
+    assert cats["b-vir"] == "revenus"
+    assert cats["p-buy"] == "epargne_virement"                               # financé : compté par ses échéances
+    assert cats["p-l1"] == "transport" and cats["p-l2"] == "transport"       # l'échéance hérite la catégorie de l'achat
+    assert cats["b-l1"] == "epargne_virement" and cats["b-l2"] == "epargne_virement"
+    assert cats["p-l9"] == "autre"
+    assert mark_wallet_pairs(db, since=since) == 0                           # idempotent
+
+
+def test_wallet_installments_in_forecast(tmp_path):
+    """Les échéances restantes d'un paiement en 4 fois sont attendues sur le compte bancaire qui paie l'échéancier."""
+    from bankwatch.db import Database, Tx
+    from bankwatch.forecast import ForecastConfig, View, coverage, upcoming
+    from bankwatch.sync import mark_wallet_pairs, wallet_installments_due
+
+    db = Database(tmp_path / "w3.db")
+    db.upsert_account(id="acc-bank", bank="fortuneo", institution_id="X", requisition_id=None, iban="FR7611111", name="Courant", currency="EUR")
+    db.upsert_account(id="acc-pp", bank="paypal", institution_id="X", requisition_id=None, iban=None, name="PayPal", currency="EUR")
+    d = date(2026, 9, 27)
+    loan = {"_eb": {"bank_transaction_code": {"code": "PAYMENT", "sub_code": "LOAN"}}}
+
+    def tx(i, acc, amount, label, day=0, cp="", raw=None):
+        return Tx(id=i, account_id=acc, booking_date=d + timedelta(days=day), value_date=None, amount=amount,
+                  currency="EUR", counterparty=cp, label=label, category="autre", status="booked", raw=raw or {})
+
+    db.upsert_transactions([
+        tx("buy", "acc-pp", -2359.95, "Swiss", cp="Swiss"),
+        tx("l1", "acc-pp", -589.99, "PayPal Inc.", cp="PayPal Inc.", raw=loan),
+        tx("b1", "acc-bank", -589.99, "PAYPAL", day=1),
+        tx("l2", "acc-pp", -589.99, "PayPal Inc.", day=29, cp="PayPal Inc.", raw=loan),
+        tx("b2", "acc-bank", -589.99, "PAYPAL", day=31),
+        # un autre achat en 4 fois, soldé par anticipation : plus rien à venir
+        tx("buy2", "acc-pp", -441.01, "Showroom", day=-39, cp="Showroom"),
+        tx("m1", "acc-pp", -110.25, "PayPal Inc.", day=-39, cp="PayPal Inc.", raw=loan),
+        tx("bm1", "acc-bank", -110.25, "PAYPAL", day=-37),
+        tx("m2", "acc-pp", -110.25, "PayPal Inc.", day=-10, cp="PayPal Inc.", raw=loan),
+        tx("m3", "acc-pp", -220.51, "PayPal Inc.", day=0, cp="PayPal Inc.", raw=loan),
+    ])
+    db.commit()
+    db.set_balance("acc-bank", 700.0, date(2026, 11, 16))
+    today = date(2026, 11, 16)
+    mark_wallet_pairs(db, since=date(2026, 8, 1))
+    due = wallet_installments_due(db, today)
+    assert [(x["account_id"], x["due"], x["amount"]) for x in due] == [
+        ("acc-bank", date(2026, 11, 26), 589.99), ("acc-bank", date(2026, 12, 26), 589.98)]
+    assert "(3/4)" in due[0]["label"] and "Swiss" in due[0]["label"]
+    cfg = ForecastConfig(views=[View("14j", "rolling", 14, True)], margin=50)
+    ups = [u for u in upcoming(db, today, cfg) if u.kind == "installment"]
+    assert [(u.due, u.amount) for u in ups] == [(date(2026, 11, 26), 589.99)]      # la 4e est hors fenêtre
+    cov = next(c for c in coverage(db, today, cfg) if c.account_id == "acc-bank")
+    assert cov.total == 589.99 and cov.shortfall == 0                               # 700 − 589,99 − 50 de marge
+    # l'échéance est passée côté PayPal mais pas encore en banque : toujours attendue
+    db.upsert_transactions([tx("l3", "acc-pp", -589.99, "PayPal Inc.", day=60, cp="PayPal Inc.", raw=loan)])
+    db.commit()
+    due = wallet_installments_due(db, date(2026, 11, 27))
+    assert [(x["due"], x["amount"]) for x in due] == [(date(2026, 11, 27), 589.99), (date(2026, 12, 26), 589.98)]
+    # une fois le prélèvement passé en banque, il ne reste que la dernière
+    db.upsert_transactions([tx("b3", "acc-bank", -589.99, "PAYPAL", day=62)])
+    db.commit()
+    due = wallet_installments_due(db, date(2026, 11, 29))
+    assert [(x["due"], x["amount"]) for x in due] == [(date(2026, 12, 26), 589.98)]
